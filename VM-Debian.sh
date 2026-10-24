@@ -1,48 +1,51 @@
 #!/usr/bin/env bash
 
-# =============================================================================
-#  PROVISIONAMENTO VM DEBIAN 13 - PROXMOX VE / CEPH / HA
+# ==============================================================================
 #
-#  VMID.........: 900
-#  NAME.........: srvAD01
-#  STORAGE......: Tank (Ceph/RBD)
-#  IMAGE........: Debian 13 Trixie GenericCloud
-#  IMAGE LOCAL..: local:/var/lib/vz/template/iso/
+#  PROVISIONAMENTO DEBIAN 13 GENERICCLOUD
+#  PROXMOX VE + CEPH RBD + CLOUD-INIT + HA
 #
-#  CPU..........: 4 vCPU / host
-#  RAM..........: 4096 MiB
-#  DISK.........: 32 GB
-#  SCSI.........: VirtIO SCSI Single
-#  DISCARD......: sim
-#  IOTHREAD.....: sim
+#  VMID.............: 900
+#  NAME.............: srvAD01
 #
-#  NETWORK......: VirtIO
-#  BRIDGE.......: vmbr0
-#  MAC..........: BC:24:11:66:25:E3
-#  IPv4.........: DHCP
+#  CPU..............: 4 vCPU
+#  CPU TYPE.........: host
+#  RAM..............: 4096 MiB
 #
-#  MACHINE......: q35
-#  BIOS.........: OVMF / UEFI
-#  EFI..........: Tank
-#  TPM..........: Tank / TPM 2.0
+#  DISK.............: 32 GB
+#  STORAGE..........: Tank (Ceph/RBD)
+#  CONTROLLER.......: VirtIO SCSI Single
+#  DISCARD..........: sim
+#  IOTHREAD.........: sim
 #
-#  CLOUD-INIT...: sim
-#  USUARIO......: root
-#  ROOT SSH.....: senha habilitada
-#  QEMU AGENT...: instalado e habilitado
-#  HA...........: sim
+#  NETWORK..........: VirtIO
+#  BRIDGE...........: vmbr0
+#  MAC..............: BC:24:11:66:25:E3
+#  IPv4.............: DHCP
 #
-#  USUARIO "debian":
-#    removido da imagem antes da importacao.
+#  MACHINE..........: q35
+#  BIOS.............: OVMF / UEFI
+#  EFI STORAGE......: Tank
+#  TPM..............: Tank / TPM 2.0
 #
-# =============================================================================
+#  CLOUD-INIT.......: sim
+#  USUARIO..........: root
+#  SENHA............: solicitada no terminal
+#
+#  SSH..............: root + senha habilitados
+#  USUARIO DEBIAN...: removido
+#
+#  QEMU AGENT.......: instalado + habilitado
+#  HA...............: sim
+#
+# ==============================================================================
 
 set -Eeuo pipefail
 shopt -s inherit_errexit nullglob
 
-# =============================================================================
+# ==============================================================================
 # CONFIGURACAO
-# =============================================================================
+# ==============================================================================
 
 VMID="900"
 NAME="srvAD01"
@@ -65,20 +68,23 @@ CHECKSUM_URL="https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
 LOCAL_BASE="/var/lib/vz"
 IMAGE_DIR="${LOCAL_BASE}/template/iso"
 
-# Imagem oficial fica preservada aqui.
 IMAGE_PATH="${IMAGE_DIR}/${IMAGE_NAME}"
+DOWNLOAD_TMP="${IMAGE_PATH}.part"
 
-# Copia temporaria que sera personalizada.
+# Imagem temporaria usada para personalizacao.
 WORK_IMAGE="${IMAGE_DIR}/.${VMID}-${NAME}-custom.qcow2"
 
-# Arquivo temporario usado para configurar SSH dentro da imagem.
+# Arquivo temporario de configuracao SSH.
 SSH_CONFIG_HOST="/tmp/${VMID}-${NAME}-root-ssh.conf"
+
+# Log detalhado.
+LOG_FILE="/var/log/criar-${NAME}.log"
 
 CURRENT_STEP="Inicializacao"
 
-# =============================================================================
+# ==============================================================================
 # CORES
-# =============================================================================
+# ==============================================================================
 
 RD='\033[01;31m'
 YW='\033[33m'
@@ -89,454 +95,646 @@ CL='\033[m'
 
 BFR='\r\033[K'
 
-CM="${GN}✓${CL}"
-CROSS="${RD}✗${CL}"
+OK="${GN}✓${CL}"
+ERROR="${RD}✗${CL}"
 INFO="${BL}ℹ${CL}"
-ARROW="${CY}➜${CL}"
+WARN="${YW}⚠${CL}"
 
-# =============================================================================
-# FUNCOES
-# =============================================================================
+# ==============================================================================
+# FUNCOES VISUAIS
+# ==============================================================================
 
 header_info() {
 
-  clear
+    clear
 
-  echo
-  echo -e "${BL}============================================================${CL}"
-  echo -e "${BL} DEBIAN 13 GENERICCLOUD - PROXMOX VE${CL}"
-  echo -e "${BL} VM ${VMID} - ${NAME}${CL}"
-  echo -e "${BL}============================================================${CL}"
-  echo
-
+    echo
+    echo -e "${BL}============================================================${CL}"
+    echo -e "${BL} DEBIAN 13 GENERICCLOUD - PROXMOX VE${CL}"
+    echo -e "${BL} VM ${VMID} - ${NAME}${CL}"
+    echo -e "${BL}============================================================${CL}"
+    echo
 }
 
 msg_info() {
 
-  echo -ne " ${INFO} ${YW}$1...${CL}"
-
+    echo -ne " ${INFO} ${YW}$1...${CL}"
 }
 
 msg_ok() {
 
-  echo -e "${BFR} ${CM} ${GN}$1${CL}"
-
+    echo -e "${BFR} ${OK} ${GN}$1${CL}"
 }
 
 msg_warn() {
 
-  echo -e "${BFR} ${INFO} ${YW}$1${CL}"
-
+    echo -e "${BFR} ${WARN} ${YW}$1${CL}"
 }
 
 msg_error() {
 
-  echo -e "${BFR} ${CROSS} ${RD}$1${CL}" >&2
-
+    echo -e "${BFR} ${ERROR} ${RD}$1${CL}" >&2
 }
 
 fail() {
 
-  msg_error "$1"
-  exit 1
-
+    msg_error "$1"
+    exit 1
 }
+
+# ==============================================================================
+# MOSTRAR ERRO DO LOG
+# ==============================================================================
+
+show_log_error() {
+
+    local RC="$1"
+
+    echo
+    echo -e "${RD}============================================================${CL}"
+    echo -e "${RD} ERRO${CL}"
+    echo -e "${RD}============================================================${CL}"
+    echo
+
+    printf ' %-13s %s\n' "ETAPA......." "$CURRENT_STEP"
+    printf ' %-13s %s\n' "CODIGO......" "$RC"
+    printf ' %-13s %s\n' "LOG........." "$LOG_FILE"
+
+    echo
+    echo -e "${YW}ULTIMAS LINHAS:${CL}"
+    echo
+
+    tail -n 30 "$LOG_FILE" 2>/dev/null || true
+
+    echo
+}
+
+# ==============================================================================
+# EXECUTAR COMANDO SILENCIOSAMENTE
+#
+# Todo stdout/stderr vai para LOG_FILE.
+# No terminal aparece apenas:
+#
+#   ℹ Executando...
+#   ✓ Executando
+#
+# ==============================================================================
+
+run_step() {
+
+    local DESCRIPTION="$1"
+    shift
+
+    CURRENT_STEP="$DESCRIPTION"
+
+    msg_info "$DESCRIPTION"
+
+    set +e
+
+    "$@" >>"$LOG_FILE" 2>&1
+
+    local RC=$?
+
+    set -e
+
+    if [[ "$RC" -eq 0 ]]; then
+
+        msg_ok "$DESCRIPTION"
+
+        return 0
+    fi
+
+    msg_error "$DESCRIPTION"
+
+    show_log_error "$RC"
+
+    exit "$RC"
+}
+
+# ==============================================================================
+# CLEANUP
+# ==============================================================================
 
 cleanup() {
 
-  unset ROOT_PASSWORD ROOT_PASSWORD_CONFIRM 2>/dev/null || true
+    unset ROOT_PASSWORD 2>/dev/null || true
+    unset ROOT_PASSWORD_CONFIRM 2>/dev/null || true
+    unset ROOT_PASSWORD_HASH 2>/dev/null || true
 
-  rm -f "$WORK_IMAGE" 2>/dev/null || true
-  rm -f "$SSH_CONFIG_HOST" 2>/dev/null || true
-
-}
-
-on_error() {
-
-  local EXIT_CODE=$?
-  local LINE="${1:-?}"
-
-  echo
-  msg_error "Falha durante: ${CURRENT_STEP}"
-
-  echo
-  echo -e " ${RD}ETAPA........:${CL} ${CURRENT_STEP}"
-  echo -e " ${RD}CODIGO.......:${CL} ${EXIT_CODE}"
-  echo -e " ${RD}LINHA........:${CL} ${LINE}"
-
-  if qm status "$VMID" &>/dev/null; then
-
-    echo
-    msg_warn "A VM ${VMID} foi criada parcialmente e NAO sera removida automaticamente."
-
-    echo
-    echo -e " Verifique:"
-    echo
-    echo -e "   ${BL}qm config ${VMID}${CL}"
-    echo -e "   ${BL}pvesm list ${STORAGE} --vmid ${VMID}${CL}"
-    echo
-
-  fi
-
-  exit "$EXIT_CODE"
-
+    rm -f "$DOWNLOAD_TMP" 2>/dev/null || true
+    rm -f "$WORK_IMAGE" 2>/dev/null || true
+    rm -f "$SSH_CONFIG_HOST" 2>/dev/null || true
 }
 
 trap cleanup EXIT
+
+# ==============================================================================
+# ERRO NAO TRATADO
+# ==============================================================================
+
+on_error() {
+
+    local RC=$?
+    local LINE="${1:-?}"
+
+    echo
+    msg_error "Erro inesperado"
+
+    echo
+    printf ' %-13s %s\n' "ETAPA......." "$CURRENT_STEP"
+    printf ' %-13s %s\n' "CODIGO......" "$RC"
+    printf ' %-13s %s\n' "LINHA......." "$LINE"
+    printf ' %-13s %s\n' "LOG........." "$LOG_FILE"
+
+    if [[ -f "$LOG_FILE" ]]; then
+
+        echo
+        echo -e "${YW}ULTIMAS LINHAS:${CL}"
+        echo
+
+        tail -n 30 "$LOG_FILE" || true
+    fi
+
+    echo
+
+    exit "$RC"
+}
+
 trap 'on_error $LINENO' ERR
 
-# =============================================================================
+# ==============================================================================
 # CABECALHO
-# =============================================================================
+# ==============================================================================
 
 header_info
 
-echo -e "${CY}Configuracao:${CL}"
+# Limpa log anterior.
+: >"$LOG_FILE"
+
+chmod 600 "$LOG_FILE"
+
+cat >>"$LOG_FILE" <<EOF
+============================================================
+Provisionamento ${NAME}
+VMID: ${VMID}
+Inicio: $(date '+%Y-%m-%d %H:%M:%S')
+============================================================
+
+EOF
+
+echo -e "${CY}Configuracao solicitada:${CL}"
 echo
 
-printf '  %-20s %s\n' "VMID:"          "$VMID"
-printf '  %-20s %s\n' "Nome:"          "$NAME"
-printf '  %-20s %s\n' "CPU:"           "${CORES} vCPU / host"
-printf '  %-20s %s\n' "RAM:"           "${MEMORY} MiB"
-printf '  %-20s %s\n' "Disco:"         "${DISK_SIZE}"
-printf '  %-20s %s\n' "Storage:"       "$STORAGE"
-printf '  %-20s %s\n' "SCSI:"          "VirtIO SCSI Single"
-printf '  %-20s %s\n' "Discard:"       "sim"
-printf '  %-20s %s\n' "IOThread:"      "sim"
-printf '  %-20s %s\n' "Bridge:"        "$BRIDGE"
-printf '  %-20s %s\n' "MAC:"           "$MAC"
-printf '  %-20s %s\n' "IPv4:"          "DHCP"
-printf '  %-20s %s\n' "Machine:"       "q35"
-printf '  %-20s %s\n' "BIOS:"          "OVMF / UEFI"
-printf '  %-20s %s\n' "EFI:"           "$STORAGE"
-printf '  %-20s %s\n' "TPM:"           "${STORAGE} / TPM 2.0"
-printf '  %-20s %s\n' "Usuario:"       "root"
-printf '  %-20s %s\n' "SSH root:"      "senha"
-printf '  %-20s %s\n' "QEMU Agent:"    "sim"
-printf '  %-20s %s\n' "HA:"            "sim"
+printf '  %-21s %s\n' "VMID:"       "$VMID"
+printf '  %-21s %s\n' "Nome:"       "$NAME"
+printf '  %-21s %s\n' "CPU:"        "${CORES} vCPU / host"
+printf '  %-21s %s\n' "RAM:"        "${MEMORY} MiB"
+printf '  %-21s %s\n' "Disco:"      "$DISK_SIZE"
+printf '  %-21s %s\n' "Storage:"    "$STORAGE"
+printf '  %-21s %s\n' "Controller:" "VirtIO SCSI Single"
+printf '  %-21s %s\n' "Discard:"    "sim"
+printf '  %-21s %s\n' "IOThread:"   "sim"
+printf '  %-21s %s\n' "Rede:"       "VirtIO"
+printf '  %-21s %s\n' "Bridge:"     "$BRIDGE"
+printf '  %-21s %s\n' "MAC:"        "$MAC"
+printf '  %-21s %s\n' "IPv4:"       "DHCP"
+printf '  %-21s %s\n' "Machine:"    "q35"
+printf '  %-21s %s\n' "BIOS:"       "OVMF / UEFI"
+printf '  %-21s %s\n' "EFI:"        "$STORAGE"
+printf '  %-21s %s\n' "TPM:"        "${STORAGE} / TPM 2.0"
+printf '  %-21s %s\n' "Usuario:"    "root"
+printf '  %-21s %s\n' "SSH root:"   "senha habilitada"
+printf '  %-21s %s\n' "QEMU Agent:" "sim"
+printf '  %-21s %s\n' "HA:"         "sim"
 
 echo
 
-# =============================================================================
+# ==============================================================================
 # ROOT
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Validando execucao como root"
 
 [[ "$EUID" -eq 0 ]] \
-  || fail "Execute este script como root no host Proxmox."
+    || fail "Execute este script como root."
 
 msg_ok "$CURRENT_STEP"
 
-# =============================================================================
+# ==============================================================================
 # SOLICITAR SENHA ROOT
-# =============================================================================
-
-CURRENT_STEP="Definindo senha do usuario root"
+# ==============================================================================
 
 echo
-echo -e "${CY}Senha do ROOT da nova VM:${CL}"
+echo -e "${CY}Senha do usuario root da nova VM:${CL}"
 echo
 
-while true
-do
+while true; do
 
-  read -rsp " Digite a senha do root: " ROOT_PASSWORD
-  echo
-
-  [[ -n "$ROOT_PASSWORD" ]] || {
-    msg_warn "A senha nao pode ficar vazia."
-    continue
-  }
-
-  read -rsp " Confirme a senha.......: " ROOT_PASSWORD_CONFIRM
-  echo
-
-  if [[ "$ROOT_PASSWORD" != "$ROOT_PASSWORD_CONFIRM" ]]; then
-
-    msg_warn "As senhas nao conferem."
+    read -rsp " Digite a senha do root: " ROOT_PASSWORD
     echo
-    continue
 
-  fi
+    if [[ -z "$ROOT_PASSWORD" ]]; then
 
-  break
+        msg_warn "A senha nao pode ficar vazia."
+        echo
+        continue
+    fi
 
+    if [[ ${#ROOT_PASSWORD} -lt 8 ]]; then
+
+        msg_warn "Use pelo menos 8 caracteres."
+        echo
+        continue
+    fi
+
+    read -rsp " Confirme a senha.......: " ROOT_PASSWORD_CONFIRM
+    echo
+
+    if [[ "$ROOT_PASSWORD" != "$ROOT_PASSWORD_CONFIRM" ]]; then
+
+        msg_warn "As senhas nao conferem."
+        echo
+        continue
+    fi
+
+    break
 done
 
 unset ROOT_PASSWORD_CONFIRM
 
 msg_ok "Senha do root recebida"
 
-echo
+# ==============================================================================
+# FERRAMENTAS BASICAS
+# ==============================================================================
 
-# =============================================================================
-# COMANDOS BASICOS
-# =============================================================================
+CURRENT_STEP="Validando ferramentas necessarias"
 
-CURRENT_STEP="Validando ferramentas do Proxmox"
+REQUIRED_COMMANDS=(
+    qm
+    pvesm
+    pvecm
+    ha-manager
+    qemu-img
+    wget
+    sha512sum
+    openssl
+    stat
+    ip
+    awk
+    grep
+    find
+)
 
-for CMD in \
-  qm \
-  pvesm \
-  pvecm \
-  ha-manager \
-  qemu-img \
-  wget \
-  sha512sum \
-  ip \
-  awk \
-  grep
-do
+for CMD in "${REQUIRED_COMMANDS[@]}"; do
 
-  command -v "$CMD" >/dev/null 2>&1 \
-    || fail "Comando obrigatorio nao encontrado: ${CMD}"
-
+    command -v "$CMD" >/dev/null 2>&1 \
+        || fail "Comando obrigatorio nao encontrado: ${CMD}"
 done
 
 msg_ok "$CURRENT_STEP"
 
-# =============================================================================
-# LIBGUESTFS
-# =============================================================================
+# ==============================================================================
+# HASH DA SENHA
+# ==============================================================================
 
-CURRENT_STEP="Validando virt-customize"
+CURRENT_STEP="Protegendo senha do root"
+
+ROOT_PASSWORD_HASH="$(
+    printf '%s' "$ROOT_PASSWORD" |
+        openssl passwd -6 -stdin
+)"
+
+[[ -n "$ROOT_PASSWORD_HASH" ]] \
+    || fail "Nao foi possivel gerar o hash da senha."
+
+unset ROOT_PASSWORD
+
+msg_ok "$CURRENT_STEP"
+
+# ==============================================================================
+# LIBGUESTFS
+# ==============================================================================
 
 if ! command -v virt-customize >/dev/null 2>&1; then
 
-  msg_info "Instalando libguestfs-tools"
+    run_step \
+        "Atualizando lista de pacotes" \
+        apt-get update -qq
 
-  apt-get update -qq
-
-  DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y -qq libguestfs-tools >/dev/null
-
-  msg_ok "libguestfs-tools instalado"
-
+    run_step \
+        "Instalando libguestfs-tools" \
+        env DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y -qq libguestfs-tools
 else
 
-  msg_ok "virt-customize disponivel"
-
+    msg_ok "libguestfs-tools disponivel"
 fi
 
-# =============================================================================
+command -v virt-customize >/dev/null 2>&1 \
+    || fail "virt-customize nao esta disponivel."
+
+# Backend mais previsivel em hosts Proxmox.
+export LIBGUESTFS_BACKEND=direct
+
+# Evita output de progresso de algumas ferramentas.
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
+# ==============================================================================
 # STORAGE LOCAL
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Validando storage ${LOCAL_STORAGE}"
 
-pvesm status --storage "$LOCAL_STORAGE" 2>/dev/null |
-  awk -v S="$LOCAL_STORAGE" '
-    $1 == S && $2 == "dir" && $3 == "active" {
-      OK=1
-    }
+if ! pvesm status --storage "$LOCAL_STORAGE" 2>>"$LOG_FILE" |
+    awk -v S="$LOCAL_STORAGE" '
+        $1 == S && $2 == "dir" && $3 == "active" {
+            OK=1
+        }
 
-    END {
-      exit !OK
-    }
-  ' || fail "Storage '${LOCAL_STORAGE}' nao esta ativo ou nao e DIR."
+        END {
+            exit !OK
+        }
+    '
+then
+    fail "Storage '${LOCAL_STORAGE}' nao esta ativo ou nao e DIR."
+fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Storage ${LOCAL_STORAGE} ativo"
 
-# =============================================================================
-# STORAGE CEPH
-# =============================================================================
+# ==============================================================================
+# STORAGE CEPH RBD
+# ==============================================================================
 
 CURRENT_STEP="Validando storage ${STORAGE}"
 
-pvesm status --storage "$STORAGE" 2>/dev/null |
-  awk -v S="$STORAGE" '
-    $1 == S && $2 == "rbd" && $3 == "active" {
-      OK=1
-    }
+if ! pvesm status --storage "$STORAGE" 2>>"$LOG_FILE" |
+    awk -v S="$STORAGE" '
+        $1 == S && $2 == "rbd" && $3 == "active" {
+            OK=1
+        }
 
-    END {
-      exit !OK
-    }
-  ' || fail "Storage '${STORAGE}' nao esta ativo ou nao e RBD."
+        END {
+            exit !OK
+        }
+    '
+then
+    fail "Storage '${STORAGE}' nao esta ativo ou nao e RBD."
+fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Storage ${STORAGE} ativo"
 
-# =============================================================================
+# ==============================================================================
 # BRIDGE
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Validando bridge ${BRIDGE}"
 
-ip link show "$BRIDGE" >/dev/null 2>&1 \
-  || fail "Bridge ${BRIDGE} nao encontrada."
+ip link show "$BRIDGE" >/dev/null 2>>"$LOG_FILE" \
+    || fail "Bridge '${BRIDGE}' nao encontrada."
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Bridge ${BRIDGE} disponivel"
 
-# =============================================================================
-# VMID
-# =============================================================================
+# ==============================================================================
+# VMID - CLUSTER INTEIRO
+# ==============================================================================
 
 CURRENT_STEP="Validando VMID ${VMID}"
 
-if qm status "$VMID" &>/dev/null; then
+EXISTING_VM="$(
+    find /etc/pve/nodes \
+        -path "*/qemu-server/${VMID}.conf" \
+        -print \
+        -quit \
+        2>/dev/null || true
+)"
 
-  fail "VMID ${VMID} ja existe."
+if [[ -n "$EXISTING_VM" ]]; then
 
+    fail "VMID ${VMID} ja existe no cluster: ${EXISTING_VM}"
 fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "VMID ${VMID} disponivel"
 
-# =============================================================================
-# MAC
-# =============================================================================
+# ==============================================================================
+# MAC - CLUSTER INTEIRO
+# ==============================================================================
 
-CURRENT_STEP="Validando endereco MAC"
+CURRENT_STEP="Validando MAC ${MAC}"
 
 if grep -Rqi \
-  -- "$MAC" \
-  /etc/pve/qemu-server/*.conf \
-  2>/dev/null
+    -- "$MAC" \
+    /etc/pve/nodes/*/qemu-server/*.conf \
+    2>/dev/null
 then
-
-  fail "MAC ${MAC} ja esta configurado em outra VM."
-
+    fail "MAC ${MAC} ja esta configurado em outra VM."
 fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "MAC ${MAC} disponivel"
 
-# =============================================================================
+# ==============================================================================
 # QUORUM
-# =============================================================================
+# ==============================================================================
 
-CURRENT_STEP="Validando quorum"
+CURRENT_STEP="Validando quorum do cluster"
 
-pvecm status 2>/dev/null |
-  grep -Eq '^Quorate:[[:space:]]+Yes$' \
-  || fail "Cluster Proxmox esta sem quorum."
+if ! pvecm status 2>>"$LOG_FILE" |
+    grep -Eq '^Quorate:[[:space:]]+Yes$'
+then
+    fail "Cluster sem quorum. O provisionamento foi interrompido."
+fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Cluster com quorum"
 
-# =============================================================================
+# ==============================================================================
 # HA
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Validando HA Manager"
 
-ha-manager status >/dev/null 2>&1 \
-  || fail "HA Manager nao esta disponivel."
+ha-manager status >>"$LOG_FILE" 2>&1 \
+    || fail "HA Manager nao esta disponivel."
 
-msg_ok "$CURRENT_STEP"
+msg_ok "HA Manager disponivel"
 
-# =============================================================================
-# DIRETORIO LOCAL
-# =============================================================================
+if ha-manager config 2>/dev/null |
+    grep -qE "(^|[[:space:]])vm:${VMID}([[:space:]]|$)"
+then
+    fail "O recurso HA vm:${VMID} ja existe."
+fi
+
+# ==============================================================================
+# DIRETORIO DA IMAGEM
+# ==============================================================================
 
 CURRENT_STEP="Preparando diretorio da imagem"
 
 mkdir -p "$IMAGE_DIR"
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Diretorio de imagens preparado"
 
-# =============================================================================
-# OBTER CHECKSUM OFICIAL
-# =============================================================================
+# ==============================================================================
+# OBTER SHA512 OFICIAL
+# ==============================================================================
 
 CURRENT_STEP="Obtendo SHA512 oficial"
 
 msg_info "$CURRENT_STEP"
 
+set +e
+
 EXPECTED_SHA="$(
-  wget -qO- "$CHECKSUM_URL" |
-    awk -v F="$IMAGE_NAME" '
-      $2 == F || $2 == "*" F {
-        print $1
-        exit
-      }
-    '
+    wget \
+        -q \
+        --timeout=30 \
+        --tries=3 \
+        -O - \
+        "$CHECKSUM_URL" 2>>"$LOG_FILE" |
+        awk -v F="$IMAGE_NAME" '
+            $2 == F || $2 == "*" F {
+                print $1
+                exit
+            }
+        '
 )"
 
-[[ -n "$EXPECTED_SHA" ]] \
-  || fail "Nao foi possivel obter SHA512 oficial."
+RC=$?
 
-msg_ok "$CURRENT_STEP"
+set -e
 
-# =============================================================================
-# VALIDAR / BAIXAR IMAGEM
-# =============================================================================
+if [[ "$RC" -ne 0 || -z "$EXPECTED_SHA" ]]; then
+
+    fail "Nao foi possivel obter o SHA512 oficial."
+fi
+
+msg_ok "SHA512 oficial obtido"
+
+# ==============================================================================
+# VERIFICAR IMAGEM EXISTENTE
+# ==============================================================================
 
 DOWNLOAD_IMAGE="yes"
 
 if [[ -s "$IMAGE_PATH" ]]; then
 
-  CURRENT_STEP="Validando imagem existente"
+    CURRENT_STEP="Verificando imagem Debian 13 existente"
 
-  msg_info "$CURRENT_STEP"
+    msg_info "$CURRENT_STEP"
 
-  ACTUAL_SHA="$(
-    sha512sum "$IMAGE_PATH" |
-      awk '{print $1}'
-  )"
+    EXISTING_SHA="$(
+        sha512sum "$IMAGE_PATH" |
+            awk '{print $1}'
+    )"
 
-  if [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]]; then
+    if [[ "$EXISTING_SHA" == "$EXPECTED_SHA" ]]; then
 
-    DOWNLOAD_IMAGE="no"
+        DOWNLOAD_IMAGE="no"
 
-    msg_ok "Imagem oficial atual ja existe"
+        IMAGE_SIZE_BYTES="$(stat -c%s "$IMAGE_PATH")"
 
-  else
+        IMAGE_SIZE="$(
+            awk -v B="$IMAGE_SIZE_BYTES" '
+                BEGIN {
+                    printf "%.1f MiB", B / 1024 / 1024
+                }
+            '
+        )"
 
-    msg_warn "Imagem existente nao corresponde ao latest atual"
+        msg_ok "Imagem Debian 13 ja disponivel (${IMAGE_SIZE})"
+    else
 
-  fi
+        msg_warn "Imagem local desatualizada ou invalida; sera substituida"
 
+        rm -f "$IMAGE_PATH"
+    fi
 fi
+
+# ==============================================================================
+# DOWNLOAD
+# ==============================================================================
 
 if [[ "$DOWNLOAD_IMAGE" == "yes" ]]; then
 
-  CURRENT_STEP="Baixando Debian 13 GenericCloud"
+    CURRENT_STEP="Baixando Debian 13 GenericCloud"
 
-  msg_info "$CURRENT_STEP"
+    msg_info "$CURRENT_STEP"
 
-  rm -f "${IMAGE_PATH}.part"
+    rm -f "$DOWNLOAD_TMP"
 
-  wget \
-    --progress=bar:force:noscroll \
-    -O "${IMAGE_PATH}.part" \
-    "$IMAGE_URL"
+    set +e
 
-  mv "${IMAGE_PATH}.part" "$IMAGE_PATH"
+    wget \
+        -q \
+        --timeout=30 \
+        --tries=3 \
+        --retry-connrefused \
+        -O "$DOWNLOAD_TMP" \
+        "$IMAGE_URL" \
+        >>"$LOG_FILE" 2>&1
 
-  msg_ok "$CURRENT_STEP"
+    RC=$?
 
+    set -e
+
+    if [[ "$RC" -ne 0 ]]; then
+
+        rm -f "$DOWNLOAD_TMP"
+
+        fail "Falha ao baixar Debian 13 GenericCloud."
+    fi
+
+    [[ -s "$DOWNLOAD_TMP" ]] \
+        || fail "O arquivo baixado esta vazio."
+
+    mv "$DOWNLOAD_TMP" "$IMAGE_PATH"
+
+    IMAGE_SIZE_BYTES="$(stat -c%s "$IMAGE_PATH")"
+
+    IMAGE_SIZE="$(
+        awk -v B="$IMAGE_SIZE_BYTES" '
+            BEGIN {
+                printf "%.1f MiB", B / 1024 / 1024
+            }
+        '
+    )"
+
+    msg_ok "Debian 13 GenericCloud baixado (${IMAGE_SIZE})"
 fi
 
-# =============================================================================
-# SHA512
-# =============================================================================
+# ==============================================================================
+# VALIDAR SHA512
+# ==============================================================================
 
-CURRENT_STEP="Validando SHA512"
+CURRENT_STEP="Validando SHA512 da imagem"
 
 msg_info "$CURRENT_STEP"
 
 ACTUAL_SHA="$(
-  sha512sum "$IMAGE_PATH" |
-    awk '{print $1}'
+    sha512sum "$IMAGE_PATH" |
+        awk '{print $1}'
 )"
 
-[[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] \
-  || fail "SHA512 da imagem nao corresponde ao SHA512 oficial."
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+
+    rm -f "$IMAGE_PATH"
+
+    fail "SHA512 invalido. A imagem foi removida."
+fi
 
 msg_ok "SHA512 valido"
 
-# =============================================================================
-# QCOW2
-# =============================================================================
+# ==============================================================================
+# VALIDAR QCOW2
+# ==============================================================================
 
-CURRENT_STEP="Validando QCOW2"
+run_step \
+    "Validando estrutura QCOW2" \
+    qemu-img check "$IMAGE_PATH"
 
-qemu-img check "$IMAGE_PATH" >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
+# ==============================================================================
 # CRIAR COPIA DE TRABALHO
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Criando copia temporaria da imagem"
 
@@ -545,29 +743,27 @@ msg_info "$CURRENT_STEP"
 rm -f "$WORK_IMAGE"
 
 cp \
-  --reflink=auto \
-  --sparse=always \
-  "$IMAGE_PATH" \
-  "$WORK_IMAGE"
+    --reflink=auto \
+    --sparse=always \
+    "$IMAGE_PATH" \
+    "$WORK_IMAGE"
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Copia temporaria criada"
 
-# =============================================================================
-# CONFIGURACAO SSH
-# =============================================================================
+# ==============================================================================
+# CRIAR CONFIGURACAO SSH
 #
-# O prefixo 00 e proposital.
+# Prefixo 00- garante precedencia sobre configuracoes posteriores do
+# cloud-init em /etc/ssh/sshd_config.d/.
 #
-# O OpenSSH usa o primeiro valor encontrado para varias diretivas.
-# Como /etc/ssh/sshd_config.d/*.conf e processado em ordem,
-# este arquivo deve aparecer antes de eventuais arquivos cloud-image.
-#
+# ==============================================================================
+
+CURRENT_STEP="Preparando acesso SSH root"
+
+cat >"$SSH_CONFIG_HOST" <<'EOF'
 # =============================================================================
-
-CURRENT_STEP="Preparando configuracao SSH root"
-
-cat > "$SSH_CONFIG_HOST" <<'EOF'
-# Gerenciado pelo provisionamento Proxmox
+# Gerenciado automaticamente pelo provisionamento Proxmox
+# =============================================================================
 
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -579,331 +775,415 @@ chmod 600 "$SSH_CONFIG_HOST"
 
 msg_ok "$CURRENT_STEP"
 
-# =============================================================================
+# ==============================================================================
 # PERSONALIZAR IMAGEM
-# =============================================================================
+#
+# IMPORTANTE:
+#
+# A imagem Debian GenericCloud pode nao possuir:
+#
+#   /etc/ssh/ssh_host_rsa_key
+#   /etc/ssh/ssh_host_ecdsa_key
+#   /etc/ssh/ssh_host_ed25519_key
+#
+# Nesse caso:
+#
+#   sshd -t
+#
+# retorna:
+#
+#   sshd: no hostkeys available -- exiting.
+#
+# Por isso geramos as host keys ANTES de validar sshd.
+#
+# Todo o output do virt-customize vai SOMENTE para:
+#
+#   /var/log/criar-srvAD01.log
+#
+# ==============================================================================
 
-CURRENT_STEP="Personalizando Debian 13"
+run_step \
+    "Personalizando Debian 13" \
+    virt-customize \
+        -a "$WORK_IMAGE" \
+        --install openssh-server,qemu-guest-agent \
+        --mkdir /etc/ssh/sshd_config.d \
+        --upload "${SSH_CONFIG_HOST}:/etc/ssh/sshd_config.d/00-root-password-login.conf" \
+        --chmod '0644:/etc/ssh/sshd_config.d/00-root-password-login.conf' \
+        --run-command 'if id debian >/dev/null 2>&1; then userdel -r debian || true; fi' \
+        --run-command 'systemctl enable ssh.service >/dev/null 2>&1 || true' \
+        --run-command 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true' \
+        --run-command 'rm -f /etc/ssh/ssh_host_*' \
+        --run-command 'ssh-keygen -A' \
+        --run-command '/usr/sbin/sshd -t' \
+        --run-command '/usr/sbin/sshd -T | grep -qx "permitrootlogin yes"' \
+        --run-command '/usr/sbin/sshd -T | grep -qx "passwordauthentication yes"'
 
-msg_info "$CURRENT_STEP"
-
-virt-customize \
-  -a "$WORK_IMAGE" \
-  --install openssh-server,qemu-guest-agent \
-  --mkdir /etc/ssh/sshd_config.d \
-  --upload "${SSH_CONFIG_HOST}:/etc/ssh/sshd_config.d/00-root-password-login.conf" \
-  --chmod '0644:/etc/ssh/sshd_config.d/00-root-password-login.conf' \
-  --run-command 'if id debian >/dev/null 2>&1; then userdel -r debian || true; fi' \
-  --run-command 'systemctl enable ssh.service >/dev/null 2>&1 || true' \
-  --run-command 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true' \
-  --run-command '/usr/sbin/sshd -t'
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
+# ==============================================================================
 # VALIDAR IMAGEM CUSTOMIZADA
-# =============================================================================
+# ==============================================================================
 
-CURRENT_STEP="Validando imagem personalizada"
+run_step \
+    "Validando imagem personalizada" \
+    qemu-img check "$WORK_IMAGE"
 
-qemu-img check "$WORK_IMAGE" >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
+# ==============================================================================
 # CRIAR VM
-# =============================================================================
+# ==============================================================================
 
-CURRENT_STEP="Criando VM ${VMID}"
+run_step \
+    "Criando VM ${VMID} (${NAME})" \
+    qm create "$VMID" \
+        --name "$NAME" \
+        --ostype l26 \
+        --machine q35 \
+        --bios ovmf \
+        --cpu host \
+        --sockets 1 \
+        --cores "$CORES" \
+        --memory "$MEMORY" \
+        --balloon 0 \
+        --scsihw virtio-scsi-single \
+        --net0 "virtio=${MAC},bridge=${BRIDGE}" \
+        --agent "enabled=1" \
+        --serial0 socket \
+        --vga serial0 \
+        --onboot 1 \
+        --description "Debian 13 Trixie GenericCloud | ${NAME} | Ceph RBD | HA"
 
-msg_info "$CURRENT_STEP"
+# ==============================================================================
+# IMPORTAR DISCO PARA CEPH
+# ==============================================================================
 
-qm create "$VMID" \
-  --name "$NAME" \
-  --ostype l26 \
-  --machine q35 \
-  --bios ovmf \
-  --cpu host \
-  --sockets 1 \
-  --cores "$CORES" \
-  --memory "$MEMORY" \
-  --balloon 0 \
-  --scsihw virtio-scsi-single \
-  --net0 "virtio=${MAC},bridge=${BRIDGE}" \
-  --agent "enabled=1" \
-  --serial0 socket \
-  --vga serial0 \
-  --onboot 1 \
-  --description "Debian 13 Trixie | srvAD01 | Ceph RBD | HA"
+run_step \
+    "Importando disco para ${STORAGE}" \
+    qm disk import \
+        "$VMID" \
+        "$WORK_IMAGE" \
+        "$STORAGE" \
+        --format raw
 
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
-# IMPORTAR DISCO
-# =============================================================================
-
-CURRENT_STEP="Importando disco para ${STORAGE}"
-
-msg_info "$CURRENT_STEP"
-
-qm disk import \
-  "$VMID" \
-  "$WORK_IMAGE" \
-  "$STORAGE" \
-  --format raw \
-  >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
-# IDENTIFICAR DISCO
-# =============================================================================
+# ==============================================================================
+# LOCALIZAR DISCO IMPORTADO
+# ==============================================================================
 
 CURRENT_STEP="Localizando disco importado"
 
 IMPORTED_DISK="$(
-  qm config "$VMID" |
-    awk -F': ' '
-      /^unused[0-9]+:/ {
-        print $2
-        exit
-      }
-    '
+    qm config "$VMID" |
+        awk -F': ' '
+            /^unused[0-9]+:/ {
+                print $2
+                exit
+            }
+        '
 )"
 
 [[ -n "$IMPORTED_DISK" ]] \
-  || fail "Nao foi possivel localizar o disco importado."
+    || fail "Nao foi possivel localizar o disco importado."
 
-msg_ok "${CURRENT_STEP}: ${IMPORTED_DISK}"
+msg_ok "Disco importado localizado"
 
-# =============================================================================
-# SCSI0
-# =============================================================================
+# ==============================================================================
+# CONFIGURAR SCSI0
+# ==============================================================================
 
-CURRENT_STEP="Configurando disco SCSI"
+run_step \
+    "Configurando VirtIO SCSI" \
+    qm set "$VMID" \
+        --scsi0 "${IMPORTED_DISK},discard=on,iothread=1"
 
-qm set "$VMID" \
-  --scsi0 "${IMPORTED_DISK},discard=on,iothread=1" \
-  >/dev/null
+# ==============================================================================
+# BOOT
+# ==============================================================================
 
-qm set "$VMID" \
-  --boot order=scsi0 \
-  >/dev/null
+run_step \
+    "Configurando boot pelo SCSI0" \
+    qm set "$VMID" \
+        --boot order=scsi0
 
-msg_ok "$CURRENT_STEP"
+# ==============================================================================
+# REDIMENSIONAR DISCO
+# ==============================================================================
 
-# =============================================================================
-# RESIZE
-# =============================================================================
+run_step \
+    "Redimensionando disco para ${DISK_SIZE}" \
+    qm disk resize \
+        "$VMID" \
+        scsi0 \
+        "$DISK_SIZE"
 
-CURRENT_STEP="Redimensionando disco para ${DISK_SIZE}"
+# ==============================================================================
+# EFI / OVMF
+# ==============================================================================
 
-qm disk resize \
-  "$VMID" \
-  scsi0 \
-  "$DISK_SIZE" \
-  >/dev/null
+run_step \
+    "Criando EFI Disk no ${STORAGE}" \
+    qm set "$VMID" \
+        --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=0"
 
-msg_ok "$CURRENT_STEP"
+# ==============================================================================
+# TPM 2.0
+# ==============================================================================
 
-# =============================================================================
-# EFI
-# =============================================================================
+run_step \
+    "Criando TPM 2.0 no ${STORAGE}" \
+    qm set "$VMID" \
+        --tpmstate0 "${STORAGE}:1,version=v2.0"
 
-CURRENT_STEP="Criando EFI Disk"
+# ==============================================================================
+# CLOUD-INIT DISK
+# ==============================================================================
 
-qm set "$VMID" \
-  --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=0" \
-  >/dev/null
+run_step \
+    "Criando Cloud-Init Disk no ${STORAGE}" \
+    qm set "$VMID" \
+        --ide2 "${STORAGE}:cloudinit"
 
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
-# TPM
-# =============================================================================
-
-CURRENT_STEP="Criando TPM 2.0"
-
-qm set "$VMID" \
-  --tpmstate0 "${STORAGE}:1,version=v2.0" \
-  >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
-# CLOUD-INIT
-# =============================================================================
-
-CURRENT_STEP="Criando Cloud-Init Disk"
-
-qm set "$VMID" \
-  --ide2 "${STORAGE}:cloudinit" \
-  >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
+# ==============================================================================
 # CLOUD-INIT ROOT
-# =============================================================================
+# ==============================================================================
 
-CURRENT_STEP="Configurando usuario root"
+run_step \
+    "Configurando Cloud-Init para root" \
+    qm set "$VMID" \
+        --ciuser root \
+        --cipassword "$ROOT_PASSWORD_HASH" \
+        --ipconfig0 "ip=dhcp" \
+        --ciupgrade 0
 
-msg_info "$CURRENT_STEP"
+unset ROOT_PASSWORD_HASH
 
-qm set "$VMID" \
-  --ciuser root \
-  --cipassword "$ROOT_PASSWORD" \
-  --ipconfig0 ip=dhcp \
-  --ciupgrade 0 \
-  >/dev/null
+# ==============================================================================
+# ATUALIZAR CLOUD-INIT
+# ==============================================================================
 
-qm cloudinit update "$VMID" >/dev/null
+run_step \
+    "Atualizando Cloud-Init" \
+    qm cloudinit update "$VMID"
 
-msg_ok "$CURRENT_STEP"
-
-# A senha nao precisa mais permanecer na variavel.
-unset ROOT_PASSWORD
-
-# =============================================================================
+# ==============================================================================
 # VALIDAR CLOUD-INIT
-# =============================================================================
+# ==============================================================================
 
-CURRENT_STEP="Validando Cloud-Init root"
+CURRENT_STEP="Validando Cloud-Init"
 
-CLOUDINIT_DATA="$(
-  qm cloudinit dump "$VMID" user
+CLOUD_USER_DATA="$(
+    qm cloudinit dump "$VMID" user 2>>"$LOG_FILE"
 )"
 
-echo "$CLOUDINIT_DATA" |
-  grep -q '^user: root$' \
-  || fail "Cloud-Init nao esta configurado para root."
+echo "$CLOUD_USER_DATA" |
+    grep -q '^user: root$' \
+    || fail "Cloud-Init nao esta configurado para usuario root."
 
-echo "$CLOUDINIT_DATA" |
-  grep -q '^disable_root: False$' \
-  || fail "Cloud-Init nao liberou root."
+echo "$CLOUD_USER_DATA" |
+    grep -q '^disable_root: False$' \
+    || fail "Cloud-Init nao liberou o usuario root."
 
-msg_ok "$CURRENT_STEP"
+if echo "$CLOUD_USER_DATA" |
+    grep -qE '^users:|^[[:space:]]*-[[:space:]]+default'
+then
+    fail "Cloud-Init ainda contem configuracao de usuario default."
+fi
 
-# =============================================================================
+unset CLOUD_USER_DATA
+
+msg_ok "Cloud-Init root validado"
+
+# ==============================================================================
+# VALIDAR HARDWARE FINAL
+# ==============================================================================
+
+CURRENT_STEP="Validando configuracao da VM"
+
+VM_CONFIG="$(
+    qm config "$VMID"
+)"
+
+echo "$VM_CONFIG" |
+    grep -q '^bios: ovmf$' \
+    || fail "BIOS OVMF nao configurada."
+
+echo "$VM_CONFIG" |
+    grep -q '^machine: q35' \
+    || fail "Machine q35 nao configurada."
+
+echo "$VM_CONFIG" |
+    grep -q '^cpu: host' \
+    || fail "CPU type host nao configurado."
+
+echo "$VM_CONFIG" |
+    grep -q '^scsihw: virtio-scsi-single$' \
+    || fail "VirtIO SCSI Single nao configurado."
+
+echo "$VM_CONFIG" |
+    grep -qi "^net0: .*${MAC}" \
+    || fail "MAC ${MAC} nao encontrada na VM."
+
+echo "$VM_CONFIG" |
+    grep -q '^agent: enabled=1' \
+    || fail "QEMU Agent nao habilitado no Proxmox."
+
+echo "$VM_CONFIG" |
+    grep -q '^tpmstate0:' \
+    || fail "TPM 2.0 nao configurado."
+
+echo "$VM_CONFIG" |
+    grep -q '^efidisk0:' \
+    || fail "EFI Disk nao configurado."
+
+echo "$VM_CONFIG" |
+    grep -q '^ide2:.*cloudinit' \
+    || fail "Cloud-Init Disk nao configurado."
+
+unset VM_CONFIG
+
+msg_ok "Hardware da VM validado"
+
+# ==============================================================================
 # HA
-# =============================================================================
+#
+# state=started entrega o gerenciamento da inicializacao ao HA.
+# Nao executar "qm start" separadamente.
+#
+# ==============================================================================
 
-CURRENT_STEP="Adicionando VM ao HA"
+run_step \
+    "Adicionando VM ao HA" \
+    ha-manager add \
+        "vm:${VMID}" \
+        --state started
 
-msg_info "$CURRENT_STEP"
-
-ha-manager add \
-  "vm:${VMID}" \
-  --state started \
-  >/dev/null
-
-msg_ok "$CURRENT_STEP"
-
-# =============================================================================
+# ==============================================================================
 # VALIDAR HA
-# =============================================================================
+# ==============================================================================
 
 CURRENT_STEP="Validando recurso HA"
 
-ha-manager config |
-  grep -q "vm:${VMID}" \
-  || fail "VM criada, mas nao registrada corretamente no HA."
+if ! ha-manager config |
+    grep -qE "(^|[[:space:]])vm:${VMID}([[:space:]]|$)"
+then
+    fail "VM criada, mas o recurso HA vm:${VMID} nao foi encontrado."
+fi
 
-msg_ok "$CURRENT_STEP"
+msg_ok "Recurso HA vm:${VMID} configurado"
 
-# =============================================================================
-# RESULTADO
-# =============================================================================
+# ==============================================================================
+# RESULTADO FINAL
+# ==============================================================================
 
 echo
 echo -e "${GN}============================================================${CL}"
-echo -e "${GN} VM CRIADA COM SUCESSO${CL}"
+echo -e "${GN} PROVISIONAMENTO CONCLUIDO${CL}"
 echo -e "${GN}============================================================${CL}"
 echo
 
-printf '  %-22s %s\n' "VMID:"             "$VMID"
-printf '  %-22s %s\n' "Nome:"             "$NAME"
-printf '  %-22s %s\n' "CPU:"              "${CORES} vCPU / host"
-printf '  %-22s %s\n' "RAM:"              "${MEMORY} MiB"
-printf '  %-22s %s\n' "Disco:"            "${DISK_SIZE}"
-printf '  %-22s %s\n' "Storage:"          "$STORAGE"
-printf '  %-22s %s\n' "SCSI:"             "VirtIO SCSI Single"
-printf '  %-22s %s\n' "Discard:"          "ON"
-printf '  %-22s %s\n' "IOThread:"         "ON"
+printf '  %-23s %s\n' "VMID:"              "$VMID"
+printf '  %-23s %s\n' "Nome:"              "$NAME"
 
 echo
 
-printf '  %-22s %s\n' "Rede:"             "VirtIO"
-printf '  %-22s %s\n' "Bridge:"           "$BRIDGE"
-printf '  %-22s %s\n' "MAC:"              "$MAC"
-printf '  %-22s %s\n' "IPv4:"             "DHCP"
+printf '  %-23s %s\n' "CPU:"               "${CORES} vCPU"
+printf '  %-23s %s\n' "CPU Type:"          "host"
+printf '  %-23s %s\n' "RAM:"               "${MEMORY} MiB"
+printf '  %-23s %s\n' "Ballooning:"         "desabilitado"
 
 echo
 
-printf '  %-22s %s\n' "Machine:"          "q35"
-printf '  %-22s %s\n' "BIOS:"             "OVMF / UEFI"
-printf '  %-22s %s\n' "EFI:"              "$STORAGE"
-printf '  %-22s %s\n' "TPM:"              "${STORAGE} / TPM 2.0"
+printf '  %-23s %s\n' "Disco:"             "$DISK_SIZE"
+printf '  %-23s %s\n' "Storage:"           "$STORAGE"
+printf '  %-23s %s\n' "Controller:"        "VirtIO SCSI Single"
+printf '  %-23s %s\n' "Discard:"           "ON"
+printf '  %-23s %s\n' "IOThread:"          "ON"
 
 echo
 
-printf '  %-22s %s\n' "Usuario:"          "root"
-printf '  %-22s %s\n' "Usuario debian:"   "removido"
-printf '  %-22s %s\n' "SSH root:"         "habilitado"
-printf '  %-22s %s\n' "SSH por senha:"    "habilitado"
-printf '  %-22s %s\n' "QEMU Agent:"       "instalado/habilitado"
-printf '  %-22s %s\n' "HA:"               "vm:${VMID}"
-printf '  %-22s %s\n' "HA State:"         "started"
+printf '  %-23s %s\n' "Rede:"              "VirtIO"
+printf '  %-23s %s\n' "Bridge:"            "$BRIDGE"
+printf '  %-23s %s\n' "MAC:"               "$MAC"
+printf '  %-23s %s\n' "IPv4:"              "DHCP"
 
 echo
 
-# =============================================================================
+printf '  %-23s %s\n' "Machine:"           "q35"
+printf '  %-23s %s\n' "BIOS:"              "OVMF / UEFI"
+printf '  %-23s %s\n' "EFI Storage:"       "$STORAGE"
+printf '  %-23s %s\n' "TPM:"               "${STORAGE} / TPM 2.0"
+
+echo
+
+printf '  %-23s %s\n' "Cloud-Init:"        "$STORAGE"
+printf '  %-23s %s\n' "Usuario:"           "root"
+printf '  %-23s %s\n' "Senha root:"        "configurada"
+printf '  %-23s %s\n' "Usuario debian:"    "removido"
+printf '  %-23s %s\n' "SSH root:"          "habilitado"
+printf '  %-23s %s\n' "SSH por senha:"     "habilitado"
+
+echo
+
+printf '  %-23s %s\n' "QEMU Agent:"        "instalado/habilitado"
+printf '  %-23s %s\n' "HA Resource:"       "vm:${VMID}"
+printf '  %-23s %s\n' "HA Requested State:" "started"
+
+echo
+
+printf '  %-23s %s\n' "Log completo:"       "$LOG_FILE"
+
+# ==============================================================================
 # CONFIGURACAO EFETIVA
-# =============================================================================
+# ==============================================================================
 
+echo
 echo -e "${BL}============================================================${CL}"
 echo -e "${BL} CONFIGURACAO EFETIVA DA VM${CL}"
 echo -e "${BL}============================================================${CL}"
 echo
 
 qm config "$VMID" |
-  grep -E \
-  '^(agent|bios|boot|ciuser|cores|cpu|efidisk0|ide2|ipconfig0|machine|memory|name|net0|scsi0|scsihw|serial0|tpmstate0|vga):'
+    grep -E \
+        '^(agent|bios|boot|ciuser|cores|cpu|efidisk0|ide2|ipconfig0|machine|memory|name|net0|scsi0|scsihw|serial0|tpmstate0|vga):'
+
+# ==============================================================================
+# HA STATUS
+# ==============================================================================
 
 echo
-
-# =============================================================================
-# HA
-# =============================================================================
-
 echo -e "${BL}============================================================${CL}"
 echo -e "${BL} ESTADO HA${CL}"
 echo -e "${BL}============================================================${CL}"
 echo
 
 ha-manager status |
-  grep -E "(^quorum|^master|vm:${VMID})" \
-  || true
+    grep -E "(^quorum|^master|vm:${VMID})" \
+    || true
 
-echo
-
-# =============================================================================
+# ==============================================================================
 # ACESSO
-# =============================================================================
+# ==============================================================================
 
+echo
 echo -e "${BL}============================================================${CL}"
-echo -e "${BL} ACESSO${CL}"
+echo -e "${BL} ACESSO AO DEBIAN${CL}"
 echo -e "${BL}============================================================${CL}"
 echo
 
-echo -e " Usuario SSH:"
+echo -e " Usuario:"
 echo
 echo -e "   ${GN}root${CL}"
 echo
-echo -e " Depois de descobrir o IP recebido via DHCP:"
+
+echo -e " Apos obter o IP recebido via DHCP:"
 echo
 echo -e "   ${BL}ssh root@IP_DA_VM${CL}"
 echo
 
-echo -e "${GN}Provisionamento concluido.${CL}"
+echo -e "${GN}Provisionamento finalizado com sucesso.${CL}"
 echo
+
+cat >>"$LOG_FILE" <<EOF
+
+============================================================
+Provisionamento concluido
+Fim: $(date '+%Y-%m-%d %H:%M:%S')
+============================================================
+EOF
