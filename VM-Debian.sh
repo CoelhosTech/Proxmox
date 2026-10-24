@@ -54,7 +54,7 @@ STORAGE="Tank"
 LOCAL_STORAGE="local"
 
 BRIDGE="vmbr0"
-MAC="BC:24:11:66:25:E3"
+="BC:24:11:66:25:E3"
 
 CORES="4"
 MEMORY="4096"
@@ -296,9 +296,9 @@ printf '  %-21s %s\n' "Discard:"    "sim"
 printf '  %-21s %s\n' "IOThread:"   "sim"
 printf '  %-21s %s\n' "Rede:"       "VirtIO"
 printf '  %-21s %s\n' "Bridge:"     "$BRIDGE"
-printf '  %-21s %s\n' "MAC:"        "$MAC"
+printf '  %-21s %s\n' ":"        "$"
 printf '  %-21s %s\n' "IPv4:"       "DHCP"
-printf '  %-21s %s\n' "Machine:"    "q35"
+printf '  %-21s %s\n' "hine:"    "q35"
 printf '  %-21s %s\n' "BIOS:"       "OVMF / UEFI"
 printf '  %-21s %s\n' "EFI:"        "$STORAGE"
 printf '  %-21s %s\n' "TPM:"        "${STORAGE} / TPM 2.0"
@@ -519,19 +519,63 @@ msg_ok "VMID ${VMID} disponivel"
 
 # ==============================================================================
 # MAC - CLUSTER INTEIRO
+#
+# MAC duplicado e permitido se a VM que ja o utiliza estiver DESLIGADA.
+# Se estiver LIGADA, o provisionamento e interrompido.
 # ==============================================================================
 
 CURRENT_STEP="Validando MAC ${MAC}"
 
-if grep -Rqi \
-    -- "$MAC" \
-    /etc/pve/nodes/*/qemu-server/*.conf \
-    2>/dev/null
-then
-    fail "MAC ${MAC} ja esta configurado em outra VM."
-fi
+MAC_FOUND="no"
 
-msg_ok "MAC ${MAC} disponivel"
+while IFS= read -r CONF; do
+
+    [[ -f "$CONF" ]] || continue
+
+    if grep -qi -- "$MAC" "$CONF"; then
+
+        MAC_FOUND="yes"
+
+        OLD_VMID="$(
+            basename "$CONF" .conf
+        )"
+
+        OLD_NODE="$(
+            echo "$CONF" |
+                awk -F'/' '{print $5}'
+        )"
+
+        msg_warn "MAC ${MAC} ja pertence a VM ${OLD_VMID} no node ${OLD_NODE}"
+
+        OLD_STATUS="$(
+            pvesh get "/nodes/${OLD_NODE}/qemu/${OLD_VMID}/status/current" \
+                --output-format json 2>/dev/null |
+            grep -o '"status":"[^"]*"' |
+            cut -d'"' -f4
+        )"
+
+        if [[ "$OLD_STATUS" == "running" ]]; then
+
+            fail "A VM ${OLD_VMID} esta LIGADA usando o mesmo MAC ${MAC}."
+
+        fi
+
+        msg_ok "VM ${OLD_VMID} esta desligada; MAC duplicado permitido temporariamente"
+
+    fi
+
+done < <(
+    find /etc/pve/nodes \
+        -path "*/qemu-server/*.conf" \
+        -type f \
+        2>/dev/null
+)
+
+if [[ "$MAC_FOUND" == "no" ]]; then
+
+    msg_ok "MAC ${MAC} disponivel"
+
+fi
 
 # ==============================================================================
 # QUORUM
