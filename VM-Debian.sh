@@ -169,7 +169,9 @@ else
     done
     exec >>"$LOG" 2>&1
 
-echo ">>> Etapa: CRIAR_VM - Iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
+msg=\">>> Etapa: CRIAR_VM - Iniciando criação da VM ${HOSTNAME} (VMID $VMID)\"
+echo "$msg" | tee -a "$LOG"
+printf "%s\n" "$msg" > /dev/tty
 fi
 
 # ============================================================
