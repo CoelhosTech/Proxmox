@@ -74,11 +74,11 @@ read -rsp "Senha do administrador: " AD_ADMIN_PASS
 echo    # newline
 
 # --------------------------- Pre‑install packages ---------------------------
-log INFO "Instalando dependências (samba, krb5, winbind, dnsutils, ntp)..."
+log INFO "Instalando dependências (samba, krb5, winbind, dnsutils, chrony)..."
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -yqq \
     samba samba-dsdb-modules samba-vfs-modules \
-    krb5-user winbind dnsutils ntp
+    krb5-user winbind dnsutils chrony
 
 # --------------------------------------------------------------
 # Configurações de rede (assume que o IP está estático via DHCP reserva)
@@ -91,8 +91,10 @@ search $DOMAIN
 EOF
 
 log INFO "Sincronizando relógio com NTP ($NTP)..."
-sed -i.bak "s/^pool .*/pool $NTP iburst/" /etc/ntp.conf
-systemctl restart ntp
+sed -i.bak "/^pool /d" /etc/chrony/chrony.conf
+    echo "pool $NTP iburst" >> /etc/chrony/chrony.conf
+    systemctl restart chrony
+
 
 # ==============================================================
 #               Funções específicas de ROLE
