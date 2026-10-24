@@ -79,8 +79,11 @@ DOWNLOAD_TMP="${IMAGE_PATH}.part"
 # Imagem temporaria usada para personalizacao.
 WORK_IMAGE="${IMAGE_DIR}/.${VMID}-${NAME}-custom.qcow2"
 
-# Arquivo temporario de configuracao SSH.
+# Arquivos temporarios usados na personalizacao da imagem.
 SSH_CONFIG_HOST="/tmp/${VMID}-${NAME}-root-ssh.conf"
+NETWORK_CONFIG_HOST="/tmp/${VMID}-${NAME}-05-proxmox-dhcp.network"
+CLOUD_NETWORK_HOST="/tmp/${VMID}-${NAME}-99-disable-network-config.cfg"
+QGA_UDEV_HOST="/tmp/${VMID}-${NAME}-qemu-guest-agent.rules"
 
 # Log detalhado.
 LOG_FILE="/var/log/criar-${NAME}.log"
@@ -226,7 +229,9 @@ cleanup() {
     rm -f "$DOWNLOAD_TMP" 2>/dev/null || true
     rm -f "$WORK_IMAGE" 2>/dev/null || true
     rm -f "$SSH_CONFIG_HOST" 2>/dev/null || true
-    rm -f "${QGA_UDEV_HOST:-}" 2>/dev/null || true
+    rm -f "$NETWORK_CONFIG_HOST" 2>/dev/null || true
+    rm -f "$CLOUD_NETWORK_HOST" 2>/dev/null || true
+    rm -f "$QGA_UDEV_HOST" 2>/dev/null || true
 }
 
 trap cleanup EXIT
@@ -302,7 +307,7 @@ printf '  %-21s %s\n' "SSD Emulation:" "sim"
 printf '  %-21s %s\n' "Rede:"       "VirtIO"
 printf '  %-21s %s\n' "Bridge:"     "$BRIDGE"
 printf '  %-21s %s\n' "MAC:"        "$MAC"
-printf '  %-21s %s\n' "IPv4:"       "DHCP"
+printf '  %-21s %s\n' "IPv4:"       "DHCP / systemd-networkd"
 printf '  %-21s %s\n' "Firewall:"   "sim"
 printf '  %-21s %s\n' "Machine:"    "q35"
 printf '  %-21s %s\n' "BIOS:"       "OVMF / UEFI"
@@ -832,26 +837,40 @@ chmod 600 "$SSH_CONFIG_HOST"
 msg_ok "$CURRENT_STEP"
 
 # ==============================================================================
-# PERSONALIZAR IMAGEM
+# PREPARAR REDE NATIVA / SSH / QEMU AGENT
 #
-# - instala openssh-server e qemu-guest-agent
-# - remove o usuario debian
-# - habilita root por senha no SSH
-# - cria host keys do SSH
-# - instala regra udev para iniciar o QEMU Guest Agent quando a porta
-#   org.qemu.guest_agent.0 aparecer
-# - adiciona fallback de inicializacao pelo multi-user.target
+# Debian 13 GenericCloud utiliza systemd-networkd. Para o DHCP nao depender do
+# renderer de rede do Cloud-Init, configuramos diretamente uma unidade .network
+# associada ao MAC da VM. O Cloud-Init continua sendo usado somente para
+# usuario/senha no primeiro boot.
 #
-# Todo stdout/stderr permanece somente no LOG_FILE.
+# O systemd-ssh-generator tenta criar sockets SSH via AF_VSOCK em VMs. Como esta
+# VM usa SSH TCP normal e nao possui dispositivo VSOCK, o generator e mascarado
+# para eliminar a mensagem "Failed to query local AF_VSOCK CID" no console.
 # ==============================================================================
 
-QGA_UDEV_HOST="/tmp/${VMID}-${NAME}-qemu-guest-agent.rules"
+cat >"$NETWORK_CONFIG_HOST" <<EOF
+[Match]
+MACAddress=${MAC}
+
+[Link]
+RequiredForOnline=yes
+RequiredFamilyForOnline=ipv4
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=yes
+EOF
+
+cat >"$CLOUD_NETWORK_HOST" <<'EOF'
+network: {config: disabled}
+EOF
 
 cat >"$QGA_UDEV_HOST" <<'EOF'
 SUBSYSTEM=="virtio-ports", ATTR{name}=="org.qemu.guest_agent.0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="qemu-guest-agent.service"
 EOF
 
-chmod 600 "$QGA_UDEV_HOST"
+chmod 600 "$NETWORK_CONFIG_HOST" "$CLOUD_NETWORK_HOST" "$QGA_UDEV_HOST"
 
 run_step \
     "Personalizando Debian 13" \
@@ -860,10 +879,17 @@ run_step \
         --install openssh-server,qemu-guest-agent \
         --mkdir /etc/ssh/sshd_config.d \
         --mkdir /etc/udev/rules.d \
+        --mkdir /etc/systemd/network \
+        --mkdir /etc/systemd/system-generators \
+        --mkdir /etc/cloud/cloud.cfg.d \
         --upload "${SSH_CONFIG_HOST}:/etc/ssh/sshd_config.d/00-root-password-login.conf" \
         --chmod '0644:/etc/ssh/sshd_config.d/00-root-password-login.conf' \
         --upload "${QGA_UDEV_HOST}:/etc/udev/rules.d/99-qemu-guest-agent.rules" \
         --chmod '0644:/etc/udev/rules.d/99-qemu-guest-agent.rules' \
+        --upload "${NETWORK_CONFIG_HOST}:/etc/systemd/network/05-proxmox-dhcp.network" \
+        --chmod '0644:/etc/systemd/network/05-proxmox-dhcp.network' \
+        --upload "${CLOUD_NETWORK_HOST}:/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg" \
+        --chmod '0644:/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg' \
         --run-command 'if id debian >/dev/null 2>&1; then userdel -r debian || true; fi' \
         --run-command 'rm -f /etc/ssh/ssh_host_*' \
         --run-command 'ssh-keygen -A' \
@@ -871,10 +897,14 @@ run_step \
         --run-command '/usr/sbin/sshd -t' \
         --run-command '/usr/sbin/sshd -T | grep -qx "permitrootlogin yes"' \
         --run-command '/usr/sbin/sshd -T | grep -qx "passwordauthentication yes"' \
+        --run-command 'systemctl enable ssh.service >/dev/null 2>&1 || true' \
+        --run-command 'systemctl enable systemd-networkd.service >/dev/null 2>&1 || true' \
+        --run-command 'systemctl enable systemd-networkd-wait-online.service >/dev/null 2>&1 || true' \
+        --run-command 'ln -sf /dev/null /etc/systemd/system-generators/systemd-ssh-generator' \
         --run-command 'install -d /etc/systemd/system/multi-user.target.wants' \
         --run-command 'ln -sf /usr/lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service'
 
-rm -f "$QGA_UDEV_HOST"
+rm -f "$NETWORK_CONFIG_HOST" "$CLOUD_NETWORK_HOST" "$QGA_UDEV_HOST"
 
 # ==============================================================================
 # VALIDAR IMAGEM CUSTOMIZADA
@@ -1004,7 +1034,6 @@ run_step \
     qm set "$VMID" \
         --ciuser root \
         --cipassword "$ROOT_PASSWORD_HASH" \
-        --ipconfig0 "ip=dhcp" \
         --ciupgrade 0
 
 unset ROOT_PASSWORD_HASH
@@ -1195,44 +1224,170 @@ fi
 msg_ok "QEMU Guest Agent respondendo"
 
 # ==============================================================================
-# AGUARDAR CLOUD-INIT
+# AGUARDAR CLOUD-INIT FINALIZAR
+#
+# Debian 13 / cloud-init 25.x pode terminar como:
+#
+#   status: done
+#   extended_status: degraded done
+#   extended_status: error - done
+#
+# O comando "cloud-init status" retorna codigo diferente de zero quando ha
+# erros, mesmo depois que terminou. Alem disso, "qm guest exec" devolve o
+# exitcode do processo DENTRO do JSON e normalmente retorna 0 no shell do
+# Proxmox. Portanto a decisao precisa ser feita pelo estado reportado, nao pelo
+# codigo de retorno do comando externo.
 # ==============================================================================
 
-CURRENT_STEP="Aguardando Cloud-Init concluir"
+CURRENT_STEP="Aguardando Cloud-Init finalizar"
 
 msg_info "$CURRENT_STEP"
 
-set +e
+CLOUDINIT_FINISHED="no"
+CLOUDINIT_STATUS_RESULT=""
 
-CLOUDINIT_RESULT="$(
+for ((i=1; i<=150; i++)); do
+
+    CLOUDINIT_STATUS_RESULT="$(
+        qm guest exec "$VMID" \
+            --timeout 30 \
+            -- /usr/bin/cloud-init status --long \
+            2>>"$LOG_FILE" || true
+    )"
+
+    printf '%s\n' "$CLOUDINIT_STATUS_RESULT" >>"$LOG_FILE"
+
+    if echo "$CLOUDINIT_STATUS_RESULT" |
+        grep -Eq 'status: done|extended_status: degraded done|extended_status: error - done|status: error'
+    then
+        CLOUDINIT_FINISHED="yes"
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$CLOUDINIT_FINISHED" != "yes" ]]; then
+
     qm guest exec "$VMID" \
-        /usr/bin/cloud-init status \
-        --timeout 300 \
-        -- --wait \
-        2>>"$LOG_FILE"
+        --timeout 30 \
+        -- /bin/sh -c 'echo "=== cloud-init status --long ==="; cloud-init status --long || true; echo; echo "=== systemctl --failed ==="; systemctl --failed --no-legend --plain || true; echo; echo "=== cloud-init.log ==="; tail -n 120 /var/log/cloud-init.log 2>/dev/null || true; echo; echo "=== cloud-init-output.log ==="; tail -n 120 /var/log/cloud-init-output.log 2>/dev/null || true' \
+        >>"$LOG_FILE" 2>&1 || true
+
+    fail "Cloud-Init nao atingiu um estado final em 300 segundos. Consulte ${LOG_FILE}."
+fi
+
+msg_ok "Cloud-Init finalizou o primeiro boot"
+
+# ==============================================================================
+# CLASSIFICAR ESTADO DO CLOUD-INIT
+# ==============================================================================
+
+CURRENT_STEP="Verificando estado do Cloud-Init"
+
+CLOUDINIT_STATE="unknown"
+
+if echo "$CLOUDINIT_STATUS_RESULT" |
+    grep -q 'extended_status: degraded done'
+then
+    CLOUDINIT_STATE="degraded"
+
+elif echo "$CLOUDINIT_STATUS_RESULT" |
+    grep -Eq 'extended_status: error - done|status: error'
+then
+    CLOUDINIT_STATE="error"
+
+elif echo "$CLOUDINIT_STATUS_RESULT" |
+    grep -q 'status: done'
+then
+    CLOUDINIT_STATE="done"
+fi
+
+case "$CLOUDINIT_STATE" in
+    done)
+        msg_ok "Cloud-Init concluido"
+        ;;
+
+    degraded)
+        msg_warn "Cloud-Init concluido com avisos (degraded done)"
+        ;;
+
+    error)
+        msg_warn "Cloud-Init reportou erro; validando configuracao essencial"
+
+        # Mantem diagnostico detalhado no log sem poluir o terminal.
+        qm guest exec "$VMID" \
+            --timeout 60 \
+            -- /bin/sh -c 'echo "=== cloud-init status --long ==="; cloud-init status --long || true; echo; echo "=== boot-finished ==="; ls -l /var/lib/cloud/instance/boot-finished 2>/dev/null || true; echo; echo "=== systemctl --failed ==="; systemctl --failed --no-legend --plain || true; echo; echo "=== cloud-init.log ==="; tail -n 160 /var/log/cloud-init.log 2>/dev/null || true; echo; echo "=== cloud-init-output.log ==="; tail -n 160 /var/log/cloud-init-output.log 2>/dev/null || true' \
+            >>"$LOG_FILE" 2>&1 || true
+        ;;
+
+    *)
+        printf '%s\n' "$CLOUDINIT_STATUS_RESULT" >>"$LOG_FILE"
+        fail "Nao foi possivel determinar o estado final do Cloud-Init. Consulte ${LOG_FILE}."
+        ;;
+esac
+
+unset CLOUDINIT_STATUS_RESULT
+
+# ==============================================================================
+# VALIDAR SENHA / CONTA ROOT
+# ==============================================================================
+
+CURRENT_STEP="Validando conta root"
+
+msg_info "$CURRENT_STEP"
+
+ROOT_ACCOUNT_RESULT="$(
+    qm guest exec "$VMID" \
+        --timeout 30 \
+        -- /bin/sh -c 'set -- $(passwd -S root); [ "${2:-}" = "P" ]' \
+        2>>"$LOG_FILE" || true
 )"
 
-RC=$?
+printf '%s\n' "$ROOT_ACCOUNT_RESULT" >>"$LOG_FILE"
 
-set -e
-
-printf '%s\n' "$CLOUDINIT_RESULT" >>"$LOG_FILE"
-
-if [[ "$RC" -ne 0 ]]; then
-    fail "Falha ao aguardar a conclusao do Cloud-Init."
+if ! echo "$ROOT_ACCOUNT_RESULT" |
+    grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'
+then
+    fail "A conta root nao ficou com senha ativa/desbloqueada apos o Cloud-Init."
 fi
 
-if ! echo "$CLOUDINIT_RESULT" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'; then
-    fail "Cloud-Init retornou erro dentro da VM."
+unset ROOT_ACCOUNT_RESULT
+
+msg_ok "Conta root com senha ativa"
+
+# ==============================================================================
+# VALIDAR IPv4 DHCP / SYSTEMD-NETWORKD
+# ==============================================================================
+
+CURRENT_STEP="Validando IPv4 DHCP da VM"
+
+msg_info "$CURRENT_STEP"
+
+IPV4_RESULT="$(
+    qm guest exec "$VMID" \
+        --timeout 30 \
+        -- /bin/sh -c 'ip -4 -o addr show scope global | grep -q "inet "' \
+        2>>"$LOG_FILE" || true
+)"
+
+printf '%s\n' "$IPV4_RESULT" >>"$LOG_FILE"
+
+if ! echo "$IPV4_RESULT" |
+    grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'
+then
+    qm guest exec "$VMID" \
+        --timeout 30 \
+        -- /bin/sh -c 'echo "=== ip -br a ==="; ip -br a; echo; echo "=== networkctl status eth0 ==="; networkctl status eth0 --no-pager || true; echo; echo "=== arquivo .network ==="; cat /etc/systemd/network/05-proxmox-dhcp.network 2>/dev/null || true; echo; echo "=== networkd journal ==="; journalctl -u systemd-networkd -b --no-pager -n 120 || true' \
+        >>"$LOG_FILE" 2>&1 || true
+
+    fail "A VM nao recebeu IPv4 por DHCP. Consulte ${LOG_FILE}."
 fi
 
-if ! echo "$CLOUDINIT_RESULT" | grep -q 'status: done'; then
-    fail "Cloud-Init nao retornou status: done."
-fi
+unset IPV4_RESULT
 
-unset CLOUDINIT_RESULT
-
-msg_ok "Cloud-Init concluido"
+msg_ok "IPv4 configurado"
 
 # ==============================================================================
 # VALIDAR GUEST AGENT DENTRO DO DEBIAN
@@ -1242,24 +1397,19 @@ CURRENT_STEP="Validando QEMU Guest Agent no Debian"
 
 msg_info "$CURRENT_STEP"
 
-set +e
-
 AGENT_SERVICE_RESULT="$(
     qm guest exec "$VMID" \
-        /bin/systemctl is-active qemu-guest-agent.service \
         --timeout 30 \
-        2>>"$LOG_FILE"
+        -- /bin/systemctl is-active qemu-guest-agent.service \
+        2>>"$LOG_FILE" || true
 )"
-
-RC=$?
-
-set -e
 
 printf '%s\n' "$AGENT_SERVICE_RESULT" >>"$LOG_FILE"
 
-if [[ "$RC" -ne 0 ]] || \
-   ! echo "$AGENT_SERVICE_RESULT" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0' || \
-   ! echo "$AGENT_SERVICE_RESULT" | grep -q 'active'
+if ! echo "$AGENT_SERVICE_RESULT" |
+    grep -q '"exitcode"[[:space:]]*:[[:space:]]*0' || \
+   ! echo "$AGENT_SERVICE_RESULT" |
+    grep -q 'active'
 then
     fail "qemu-guest-agent.service nao esta ativo dentro do Debian."
 fi
@@ -1267,6 +1417,16 @@ fi
 unset AGENT_SERVICE_RESULT
 
 msg_ok "QEMU Guest Agent ativo no Debian"
+
+# ==============================================================================
+# RESULTADO DO CLOUD-INIT
+# ==============================================================================
+
+if [[ "$CLOUDINIT_STATE" == "error" ]]; then
+    msg_warn "Cloud-Init terminou em estado de erro, mas root, IPv4 e Guest Agent foram validados; continuando"
+fi
+
+unset CLOUDINIT_STATE
 
 # ==============================================================================
 # DESLIGAR APOS PRIMEIRO BOOT
@@ -1505,7 +1665,7 @@ echo
 printf '  %-25s %s\n' "Rede:"                "VirtIO"
 printf '  %-25s %s\n' "Bridge:"              "$BRIDGE"
 printf '  %-25s %s\n' "MAC:"                 "$MAC"
-printf '  %-25s %s\n' "IPv4 inicial:"        "DHCP"
+printf '  %-25s %s\n' "IPv4 inicial:"        "DHCP / systemd-networkd"
 printf '  %-25s %s\n' "Firewall:"            "ON"
 
 echo
@@ -1523,6 +1683,7 @@ printf '  %-25s %s\n' "Senha root:"          "configurada"
 printf '  %-25s %s\n' "Usuario debian:"      "removido"
 printf '  %-25s %s\n' "SSH root:"            "habilitado"
 printf '  %-25s %s\n' "SSH por senha:"       "habilitado"
+printf '  %-25s %s\n' "SSH AF_VSOCK:"        "generator mascarado"
 printf '  %-25s %s\n' "Cloud-Init Drive:"    "removido"
 printf '  %-25s %s\n' "QEMU Guest Agent:"    "ATIVO / RESPONDENDO"
 printf '  %-25s %s\n' "Notes:"               "vazio"
