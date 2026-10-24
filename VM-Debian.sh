@@ -46,6 +46,7 @@ CLOUDINIT_WAIT_SECONDS="${CLOUDINIT_WAIT_SECONDS:-600}"
 AGENT_WAIT_SECONDS="${AGENT_WAIT_SECONDS:-240}"
 NTP_WAIT_SECONDS="${NTP_WAIT_SECONDS:-60}"
 
+# URL segura para o script da comunidade (sem caracteres que causem erro de porta)
 COMMUNITY_SCRIPT_URL="${COMMUNITY_SCRIPT_URL:-https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/vm/debian-vm.sh}"
 
 # Opcional: ROOT_PASSWORD pode ser fornecida pelo ambiente.
@@ -121,13 +122,11 @@ ip link show "$BRIDGE" >/dev/null
 
 ETAPA="VALIDAR_PARAMETROS"
 python3 - "$IP" "$PREFIX" "$GW" "$DNS1" "$DNS2" "$NTP" <<'PY'
-import ipaddress
-import sys
-ip = sys.argv[1]
-prefix = sys.argv[2]
+import ipaddress, sys
+ip, prefix = sys.argv[1], sys.argv[2]
 ipaddress.ip_interface(f"{ip}/{prefix}")
-for value in sys.argv[3:]:
-    ipaddress.ip_address(value)
+for v in sys.argv[3:]:
+    ipaddress.ip_address(v)
 PY
 
 if [[ ! "$MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
@@ -145,7 +144,6 @@ if [[ -n "$ROOT_PASSWORD" ]]; then
     echo ">>> Etapa: CRIAR_VM – senha root fornecida via ROOT_PASSWORD, iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
 else
     if [ -t 0 ]; then
-        # Restore console output
         exec 1>&3 2>&4
         clear 2>/dev/null || true
         echo "============================================================"
@@ -173,9 +171,7 @@ else
             unset ROOTPASS2
             break
         done
-        # Log progress after password set
         echo ">>> Etapa: CRIAR_VM – senha root configurada, iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
-        # Re‑redirect output to log for the rest of the script
         exec >>"$LOG" 2>&1
     else
         echo "Erro: ROOT_PASSWORD não definido e nenhum TTY disponível para solicitar a senha." >&2
@@ -208,23 +204,39 @@ rm -f "$CRED_FILE" 2>/dev/null || true
 # ============================================================
 
 ETAPA="CRIAR_VM"
-# DHCP usado somente no primeiro boot para evitar dependência de snippets.
-env VM_UNATTENDED=1 VM_OS_VERSION="$OS_VERSION" VM_VMID="$VMID" VM_DISK_SIZE="$DISK" \
-    VM_HOSTNAME="$HOSTNAME" VM_CORES="$CPU" VM_RAM="$RAM" VM_BRIDGE="$BRIDGE" \
-    VM_MAC="$MAC" VM_STORAGE="$STORAGE" VM_MACHINE="$MACHINE" VM_START="no" \
-    VM_CLOUD_INIT="yes" CLOUDINIT_USER="root" CLOUDINIT_PASSWORD="$ROOTPASS" \
-    CLOUDINIT_NETWORK_MODE="dhcp" CLOUDINIT_DNS="$DNS1 $DNS2" CLOUDINIT_SEARCH_DOMAIN="$DOMAIN" \
-    bash -c "$(curl -fsSL \"$COMMUNITY_SCRIPT_URL\")"
+# Baixar script da comunidade de forma segura
+script_content=$(curl -fsSL "$COMMUNITY_SCRIPT_URL") || { echo "Erro ao baixar script da comunidade: $COMMUNITY_SCRIPT_URL" >&2; exit 1; }
+# Executar script que cria a VM (ele gera o arquivo de configuração)
+env VM_UNATTENDED=1 \
+    VM_OS_VERSION="$OS_VERSION" \
+    VM_VMID="$VMID" \
+    VM_DISK_SIZE="$DISK" \
+    VM_HOSTNAME="$HOSTNAME" \
+    VM_CORES="$CPU" \
+    VM_RAM="$RAM" \
+    VM_BRIDGE="$BRIDGE" \
+    VM_MAC="$MAC" \
+    VM_STORAGE="$STORAGE" \
+    VM_MACHINE="$MACHINE" \
+    VM_START="no" \
+    VM_CLOUD_INIT="yes" \
+    CLOUDINIT_USER="root" \
+    CLOUDINIT_PASSWORD="$ROOTPASS" \
+    CLOUDINIT_NETWORK_MODE="dhcp" \
+    CLOUDINIT_DNS="$DNS1 $DNS2" \
+    CLOUDINIT_SEARCH_DOMAIN="$DOMAIN" \
+    bash -c "$script_content"
+
+# Aguarda o arquivo de configuração da VM existir (máx 30 s)
+wait_secs=0
+while [[ ! -f "/etc/pve/qemu-server/${VMID}.conf" && $wait_secs -lt 30 ]]; do
+    sleep 1
+    ((wait_secs++))
+done
+[[ -f "/etc/pve/qemu-server/${VMID}.conf" ]] || { echo "Arquivo de configuração da VM $VMID não foi criado após criação." >&2; exit 2; }
 
 # ============================================================
-# CREDENCIAL TEMPORÁRIA
-# ============================================================
-
-ETAPA="REMOVER_CREDENCIAL_TEMP"
-rm -f "$CRED_FILE"
-
-# ============================================================
-# PROXMOX / noVNC
+# CONFIGURAR PROXMOX
 # ============================================================
 
 ETAPA="CONFIGURAR_PROXMOX"
@@ -233,7 +245,6 @@ qm set "$VMID" --tablet 1 >/dev/null
 qm set "$VMID" --agent enabled=1 >/dev/null
 qm set "$VMID" --onboot 1 >/dev/null
 qm set "$VMID" --boot order=scsi0 >/dev/null
-# Impede console serial/xterm.js como console principal.
 qm set "$VMID" --delete serial0 >/dev/null 2>&1 || true
 
 # ============================================================
@@ -382,7 +393,7 @@ update-grub >/dev/null
  touch /etc/cloud/cloud-init.disabled
  sync
 GUEST_EOF
-"
+)"
 GUEST_B64=$(printf '%s' "$GUEST_SCRIPT" | base64 -w0)
 GUEST_JSON=$(qm guest exec "$VMID" --timeout 180 -- bash -lc "printf '%s' '$GUEST_B64' | base64 -d | bash -s -- '$HOSTNAME' '$DOMAIN' '$IP' '$PREFIX' '$GW' '$DNS1' '$DNS2' '$NTP' '$MAC' '$TIMEZONE' '$IFACE'")
 GUEST_RC=$(python3 - <<'PY' "$GUEST_JSON"
@@ -579,3 +590,4 @@ echo
 echo
  echo "VMID............... ${VMID}"
 # (demais informações omitidas para brevidade)
+
