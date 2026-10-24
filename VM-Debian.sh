@@ -168,6 +168,8 @@ else
         break
     done
     exec >>"$LOG" 2>&1
+
+echo ">>> Etapa: CRIAR_VM - Iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
 fi
 
 # ============================================================
