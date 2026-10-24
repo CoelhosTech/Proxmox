@@ -191,3 +191,4 @@ log OK "Provisionamento concluído com sucesso."
 log INFO "Caso algum bloco acima tenha sinalizado WARN/ERROR, reveja a mensagem e ajuste manualmente."
 
 exit 0
+
