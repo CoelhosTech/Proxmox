@@ -183,32 +183,29 @@ show_log_error() {
 run_step() {
 
     local DESCRIPTION="$1"
+    local RC
     shift
 
     CURRENT_STEP="$DESCRIPTION"
 
     msg_info "$DESCRIPTION"
 
-    set +e
-
-    "$@" >>"$LOG_FILE" 2>&1
-
-    local RC=$?
-
-    set -e
-
-    if [[ "$RC" -eq 0 ]]; then
+    if "$@" >>"$LOG_FILE" 2>&1; then
 
         msg_ok "$DESCRIPTION"
-
         return 0
+
+    else
+
+        RC=$?
+
+        msg_error "$DESCRIPTION"
+
+        show_log_error "$RC"
+
+        exit "$RC"
+
     fi
-
-    msg_error "$DESCRIPTION"
-
-    show_log_error "$RC"
-
-    exit "$RC"
 }
 
 # ==============================================================================
@@ -296,9 +293,9 @@ printf '  %-21s %s\n' "Discard:"    "sim"
 printf '  %-21s %s\n' "IOThread:"   "sim"
 printf '  %-21s %s\n' "Rede:"       "VirtIO"
 printf '  %-21s %s\n' "Bridge:"     "$BRIDGE"
-printf '  %-21s %s\n' ":"        "$"
+printf '  %-21s %s\n' "MAC:"        "$MAC"
 printf '  %-21s %s\n' "IPv4:"       "DHCP"
-printf '  %-21s %s\n' "hine:"    "q35"
+printf '  %-21s %s\n' "Machine:"    "q35"
 printf '  %-21s %s\n' "BIOS:"       "OVMF / UEFI"
 printf '  %-21s %s\n' "EFI:"        "$STORAGE"
 printf '  %-21s %s\n' "TPM:"        "${STORAGE} / TPM 2.0"
@@ -822,28 +819,15 @@ msg_ok "$CURRENT_STEP"
 # ==============================================================================
 # PERSONALIZAR IMAGEM
 #
-# IMPORTANTE:
+# A imagem GenericCloud pode nao possuir inicialmente:
 #
-# A imagem Debian GenericCloud pode nao possuir:
+#   - SSH host keys
+#   - /run/sshd
 #
-#   /etc/ssh/ssh_host_rsa_key
-#   /etc/ssh/ssh_host_ecdsa_key
-#   /etc/ssh/ssh_host_ed25519_key
+# Ambos sao necessarios para validar a configuracao com "sshd -t"
+# dentro do chroot do virt-customize.
 #
-# Nesse caso:
-#
-#   sshd -t
-#
-# retorna:
-#
-#   sshd: no hostkeys available -- exiting.
-#
-# Por isso geramos as host keys ANTES de validar sshd.
-#
-# Todo o output do virt-customize vai SOMENTE para:
-#
-#   /var/log/criar-srvAD01.log
-#
+# Todo stdout/stderr permanece somente no LOG_FILE.
 # ==============================================================================
 
 run_step \
@@ -859,6 +843,7 @@ run_step \
         --run-command 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true' \
         --run-command 'rm -f /etc/ssh/ssh_host_*' \
         --run-command 'ssh-keygen -A' \
+        --run-command 'install -d -m 0755 /run/sshd' \
         --run-command '/usr/sbin/sshd -t' \
         --run-command '/usr/sbin/sshd -T | grep -qx "permitrootlogin yes"' \
         --run-command '/usr/sbin/sshd -T | grep -qx "passwordauthentication yes"'
