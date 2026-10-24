@@ -1,871 +1,909 @@
 #!/usr/bin/env bash
 
+# =============================================================================
+#  PROVISIONAMENTO VM DEBIAN 13 - PROXMOX VE / CEPH / HA
+#
+#  VMID.........: 900
+#  NAME.........: srvAD01
+#  STORAGE......: Tank (Ceph/RBD)
+#  IMAGE........: Debian 13 Trixie GenericCloud
+#  IMAGE LOCAL..: local:/var/lib/vz/template/iso/
+#
+#  CPU..........: 4 vCPU / host
+#  RAM..........: 4096 MiB
+#  DISK.........: 32 GB
+#  SCSI.........: VirtIO SCSI Single
+#  DISCARD......: sim
+#  IOTHREAD.....: sim
+#
+#  NETWORK......: VirtIO
+#  BRIDGE.......: vmbr0
+#  MAC..........: BC:24:11:66:25:E3
+#  IPv4.........: DHCP
+#
+#  MACHINE......: q35
+#  BIOS.........: OVMF / UEFI
+#  EFI..........: Tank
+#  TPM..........: Tank / TPM 2.0
+#
+#  CLOUD-INIT...: sim
+#  USUARIO......: root
+#  ROOT SSH.....: senha habilitada
+#  QEMU AGENT...: instalado e habilitado
+#  HA...........: sim
+#
+#  USUARIO "debian":
+#    removido da imagem antes da importacao.
+#
+# =============================================================================
+
 set -Eeuo pipefail
-set +H
+shopt -s inherit_errexit nullglob
 
-# ============================================================
-# VARIÁVEIS OBRIGATÓRIAS
-# ============================================================
+# =============================================================================
+# CONFIGURACAO
+# =============================================================================
 
-: "${VMID:?Informe VMID}"
-: "${HOSTNAME:?Informe HOSTNAME}"
-: "${IP:?Informe IP}"
-: "${MAC:?Informe MAC}"
+VMID="900"
+NAME="srvAD01"
 
-: "${DOMAIN:?Informe DOMAIN}"
-: "${GW:?Informe GW}"
+STORAGE="Tank"
+LOCAL_STORAGE="local"
 
-: "${DNS1:?Informe DNS1}"
-: "${DNS2:?Informe DNS2}"
+BRIDGE="vmbr0"
+MAC="BC:24:11:66:25:E3"
 
-: "${NTP:?Informe NTP}"
+CORES="4"
+MEMORY="4096"
+DISK_SIZE="32G"
 
-: "${STORAGE:?Informe STORAGE}"
-: "${BRIDGE:?Informe BRIDGE}"
+IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
 
-# ============================================================
-# VARIÁVEIS OPCIONAIS
-# ============================================================
+IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/latest/${IMAGE_NAME}"
+CHECKSUM_URL="https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
 
-PREFIX="${PREFIX:-24}"
+LOCAL_BASE="/var/lib/vz"
+IMAGE_DIR="${LOCAL_BASE}/template/iso"
 
-CPU="${CPU:-4}"
-RAM="${RAM:-4096}"
-DISK="${DISK:-32G}"
+# Imagem oficial fica preservada aqui.
+IMAGE_PATH="${IMAGE_DIR}/${IMAGE_NAME}"
 
-OS_VERSION="${OS_VERSION:-13}"
-MACHINE="${MACHINE:-q35}"
+# Copia temporaria que sera personalizada.
+WORK_IMAGE="${IMAGE_DIR}/.${VMID}-${NAME}-custom.qcow2"
 
-TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
-IFACE="${IFACE:-eth0}"
+# Arquivo temporario usado para configurar SSH dentro da imagem.
+SSH_CONFIG_HOST="/tmp/${VMID}-${NAME}-root-ssh.conf"
 
-RECREATE="${RECREATE:-yes}"
+CURRENT_STEP="Inicializacao"
 
-CLOUDINIT_WAIT_SECONDS="${CLOUDINIT_WAIT_SECONDS:-600}"
-AGENT_WAIT_SECONDS="${AGENT_WAIT_SECONDS:-240}"
-NTP_WAIT_SECONDS="${NTP_WAIT_SECONDS:-60}"
+# =============================================================================
+# CORES
+# =============================================================================
 
-COMMUNITY_SCRIPT_URL="${COMMUNITY_SCRIPT_URL:-https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/vm/debian-vm.sh}"
+RD='\033[01;31m'
+YW='\033[33m'
+GN='\033[1;92m'
+BL='\033[1;94m'
+CY='\033[1;96m'
+CL='\033[m'
 
-# Opcional: ROOT_PASSWORD pode ser fornecida via ambiente
-ROOT_PASSWORD="${ROOT_PASSWORD:-}"
+BFR='\r\033[K'
 
-# ============================================================
-# DERIVAÇÕES
-# ============================================================
+CM="${GN}✓${CL}"
+CROSS="${RD}✗${CL}"
+INFO="${BL}ℹ${CL}"
+ARROW="${CY}➜${CL}"
 
-FQDN="${HOSTNAME}.${DOMAIN}"
-CIDR="${IP}/${PREFIX}"
+# =============================================================================
+# FUNCOES
+# =============================================================================
 
-LOG="/tmp/create-${HOSTNAME}.log"
-CRED_FILE="/tmp/${HOSTNAME}-${VMID}-cloud-init-credentials.txt"
+header_info() {
 
-ETAPA="INICIO"
-ROOTPASS=""
+  clear
 
-# ============================================================
-# LOG E FEEDBACK VISUAL
-# ============================================================
+  echo
+  echo -e "${BL}============================================================${CL}"
+  echo -e "${BL} DEBIAN 13 GENERICCLOUD - PROXMOX VE${CL}"
+  echo -e "${BL} VM ${VMID} - ${NAME}${CL}"
+  echo -e "${BL}============================================================${CL}"
+  echo
 
-# Salva descritores originais para saída do console
-exec 3>&1 4>&2
-
-: >"$LOG"
-exec >>"$LOG" 2>&1
-
-msg() {
-    local text="$1"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $text" >> "$LOG"
-    echo -e "$text" >&3
 }
 
-step() {
-    ETAPA="$1"
-    local desc="$2"
-    msg "\n\e[1;34m[ETAPA: ${ETAPA}]\e[0m \e[1;37m${desc}\e[0m"
+msg_info() {
+
+  echo -ne " ${INFO} ${YW}$1...${CL}"
+
 }
 
-info() { msg "  \e[36m➜\e[0m $1"; }
-ok()   { msg "  \e[32m✔\e[0m $1"; }
-warn() { msg "  \e[33m⚠\e[0m $1"; }
+msg_ok() {
 
-# ============================================================
-# TRATAMENTO DE ERROS
-# ============================================================
+  echo -e "${BFR} ${CM} ${GN}$1${CL}"
 
-falha() {
-    RC=$?
-    trap - ERR
+}
 
-    rm -f "$CRED_FILE" 2>/dev/null || true
-    ROOTPASS=""
-    ROOT_PASSWORD=""
+msg_warn() {
 
-    exec 1>&3 2>&4
+  echo -e "${BFR} ${INFO} ${YW}$1${CL}"
+
+}
+
+msg_error() {
+
+  echo -e "${BFR} ${CROSS} ${RD}$1${CL}" >&2
+
+}
+
+fail() {
+
+  msg_error "$1"
+  exit 1
+
+}
+
+cleanup() {
+
+  unset ROOT_PASSWORD ROOT_PASSWORD_CONFIRM 2>/dev/null || true
+
+  rm -f "$WORK_IMAGE" 2>/dev/null || true
+  rm -f "$SSH_CONFIG_HOST" 2>/dev/null || true
+
+}
+
+on_error() {
+
+  local EXIT_CODE=$?
+  local LINE="${1:-?}"
+
+  echo
+  msg_error "Falha durante: ${CURRENT_STEP}"
+
+  echo
+  echo -e " ${RD}ETAPA........:${CL} ${CURRENT_STEP}"
+  echo -e " ${RD}CODIGO.......:${CL} ${EXIT_CODE}"
+  echo -e " ${RD}LINHA........:${CL} ${LINE}"
+
+  if qm status "$VMID" &>/dev/null; then
 
     echo
-    echo "============================================================"
-    echo -e " \e[1;31m${HOSTNAME} - ERRO NA ETAPA: ${ETAPA} (CÓDIGO ${RC})\e[0m"
-    echo "============================================================"
-    echo "LOG COMPLETO: ${LOG}"
-    echo
-    echo "ÚLTIMAS 25 LINHAS DO LOG:"
-    echo "------------------------------------------------------------"
-    tail -n 25 "$LOG" 2>/dev/null || true
-    echo "------------------------------------------------------------"
-    echo "============================================================"
+    msg_warn "A VM ${VMID} foi criada parcialmente e NAO sera removida automaticamente."
 
-    exit "$RC"
+    echo
+    echo -e " Verifique:"
+    echo
+    echo -e "   ${BL}qm config ${VMID}${CL}"
+    echo -e "   ${BL}pvesm list ${STORAGE} --vmid ${VMID}${CL}"
+    echo
+
+  fi
+
+  exit "$EXIT_CODE"
+
 }
 
-trap falha ERR
+trap cleanup EXIT
+trap 'on_error $LINENO' ERR
 
-# ============================================================
-# PRÉ-VALIDAÇÃO DO PROXMOX
-# ============================================================
+# =============================================================================
+# CABECALHO
+# =============================================================================
 
-step "VALIDAR_PROXMOX" "Verificando pré-requisitos no host Proxmox VE"
+header_info
 
-[[ "$(id -u)" == "0" ]] || { echo "Este script deve ser executado como root."; false; }
+echo -e "${CY}Configuracao:${CL}"
+echo
 
-command -v qm >/dev/null
-command -v pvesm >/dev/null
-command -v python3 >/dev/null
-command -v curl >/dev/null
+printf '  %-20s %s\n' "VMID:"          "$VMID"
+printf '  %-20s %s\n' "Nome:"          "$NAME"
+printf '  %-20s %s\n' "CPU:"           "${CORES} vCPU / host"
+printf '  %-20s %s\n' "RAM:"           "${MEMORY} MiB"
+printf '  %-20s %s\n' "Disco:"         "${DISK_SIZE}"
+printf '  %-20s %s\n' "Storage:"       "$STORAGE"
+printf '  %-20s %s\n' "SCSI:"          "VirtIO SCSI Single"
+printf '  %-20s %s\n' "Discard:"       "sim"
+printf '  %-20s %s\n' "IOThread:"      "sim"
+printf '  %-20s %s\n' "Bridge:"        "$BRIDGE"
+printf '  %-20s %s\n' "MAC:"           "$MAC"
+printf '  %-20s %s\n' "IPv4:"          "DHCP"
+printf '  %-20s %s\n' "Machine:"       "q35"
+printf '  %-20s %s\n' "BIOS:"          "OVMF / UEFI"
+printf '  %-20s %s\n' "EFI:"           "$STORAGE"
+printf '  %-20s %s\n' "TPM:"           "${STORAGE} / TPM 2.0"
+printf '  %-20s %s\n' "Usuario:"       "root"
+printf '  %-20s %s\n' "SSH root:"      "senha"
+printf '  %-20s %s\n' "QEMU Agent:"    "sim"
+printf '  %-20s %s\n' "HA:"            "sim"
 
-pvesm status -storage "$STORAGE" >/dev/null || { echo "Storage '${STORAGE}' não encontrado ou inativo."; false; }
-ip link show "$BRIDGE" >/dev/null || { echo "Bridge '${BRIDGE}' não encontrada."; false; }
+echo
 
-ok "Ambiente Proxmox e storage '${STORAGE}' validados."
+# =============================================================================
+# ROOT
+# =============================================================================
 
-# ============================================================
-# VALIDAR PARÂMETROS
-# ============================================================
+CURRENT_STEP="Validando execucao como root"
 
-step "VALIDAR_PARAMETROS" "Validando parâmetros de rede e identificadores"
+[[ "$EUID" -eq 0 ]] \
+  || fail "Execute este script como root no host Proxmox."
 
-python3 - "$IP" "$PREFIX" "$GW" "$DNS1" "$DNS2" "$NTP" <<'PY'
-import ipaddress, sys
-ip, prefix = sys.argv[1], sys.argv[2]
-ipaddress.ip_interface(f"{ip}/{prefix}")
-for val in sys.argv[3:]:
-    ipaddress.ip_address(val)
-PY
+msg_ok "$CURRENT_STEP"
 
-if [[ ! "$MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
-    echo "MAC inválido: ${MAC}"
-    false
-fi
+# =============================================================================
+# SOLICITAR SENHA ROOT
+# =============================================================================
 
-if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
-    echo "VMID inválido: ${VMID}"
-    false
-fi
+CURRENT_STEP="Definindo senha do usuario root"
 
-ok "Parâmetros de rede válidos (IP: ${CIDR}, GW: ${GW}, MAC: ${MAC})."
+echo
+echo -e "${CY}Senha do ROOT da nova VM:${CL}"
+echo
 
-# ============================================================
-# SENHA ROOT
-# ============================================================
+while true
+do
 
-step "SENHA_ROOT" "Definindo senha root para a VM"
+  read -rsp " Digite a senha do root: " ROOT_PASSWORD
+  echo
 
-if [[ -n "$ROOT_PASSWORD" ]]; then
-    ROOTPASS="$ROOT_PASSWORD"
-    ok "Senha root obtida via variável de ambiente ROOT_PASSWORD."
+  [[ -n "$ROOT_PASSWORD" ]] || {
+    msg_warn "A senha nao pode ficar vazia."
+    continue
+  }
+
+  read -rsp " Confirme a senha.......: " ROOT_PASSWORD_CONFIRM
+  echo
+
+  if [[ "$ROOT_PASSWORD" != "$ROOT_PASSWORD_CONFIRM" ]]; then
+
+    msg_warn "As senhas nao conferem."
+    echo
+    continue
+
+  fi
+
+  break
+
+done
+
+unset ROOT_PASSWORD_CONFIRM
+
+msg_ok "Senha do root recebida"
+
+echo
+
+# =============================================================================
+# COMANDOS BASICOS
+# =============================================================================
+
+CURRENT_STEP="Validando ferramentas do Proxmox"
+
+for CMD in \
+  qm \
+  pvesm \
+  pvecm \
+  ha-manager \
+  qemu-img \
+  wget \
+  sha512sum \
+  ip \
+  awk \
+  grep
+do
+
+  command -v "$CMD" >/dev/null 2>&1 \
+    || fail "Comando obrigatorio nao encontrado: ${CMD}"
+
+done
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# LIBGUESTFS
+# =============================================================================
+
+CURRENT_STEP="Validando virt-customize"
+
+if ! command -v virt-customize >/dev/null 2>&1; then
+
+  msg_info "Instalando libguestfs-tools"
+
+  apt-get update -qq
+
+  DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -qq libguestfs-tools >/dev/null
+
+  msg_ok "libguestfs-tools instalado"
+
 else
-    if [ -t 0 ] || [ -c /dev/tty ]; then
-        exec 1>&3 2>&4
 
-        echo "============================================================"
-        echo " CRIAR ${HOSTNAME}"
-        echo "============================================================"
-        echo "VMID........ ${VMID}"
-        echo "HOSTNAME.... ${HOSTNAME}"
-        echo "FQDN........ ${FQDN}"
-        echo "IP.......... ${CIDR}"
-        echo "MAC......... ${MAC}"
-        echo "STORAGE..... ${STORAGE}"
-        echo "BRIDGE...... ${BRIDGE}"
-        echo "CONSOLE..... noVNC"
-        echo "============================================================"
-        echo
+  msg_ok "virt-customize disponivel"
 
-        while true; do
-            printf "Nova senha root: " >/dev/tty
-            IFS= read -r -s ROOTPASS </dev/tty
-            printf "\n" >/dev/tty
-
-            printf "Repita a senha:  " >/dev/tty
-            IFS= read -r -s ROOTPASS2 </dev/tty
-            printf "\n" >/dev/tty
-
-            if [[ -z "$ROOTPASS" ]]; then
-                echo "Senha não pode ser vazia." >/dev/tty
-                continue
-            fi
-
-            if [[ "$ROOTPASS" != "$ROOTPASS2" ]]; then
-                echo "Senhas não conferem. Tente novamente." >/dev/tty
-                continue
-            fi
-
-            unset ROOTPASS2
-            break
-        done
-
-        exec >>"$LOG" 2>&1
-        ok "Senha root informada e confirmada."
-    else
-        echo "ERRO: ROOT_PASSWORD não informada e nenhum TTY interativo disponível." >&4
-        false
-    fi
 fi
 
-# ============================================================
-# VM JÁ EXISTENTE
-# ============================================================
+# =============================================================================
+# STORAGE LOCAL
+# =============================================================================
 
-step "VERIFICAR_VM_EXISTENTE" "Verificando se VMID ${VMID} já existe"
+CURRENT_STEP="Validando storage ${LOCAL_STORAGE}"
 
-if qm status "$VMID" >/dev/null 2>&1; then
-    if [[ "$RECREATE" != "yes" ]]; then
-        echo "VMID ${VMID} já existe e RECREATE não está habilitado."
-        false
-    fi
+pvesm status --storage "$LOCAL_STORAGE" 2>/dev/null |
+  awk -v S="$LOCAL_STORAGE" '
+    $1 == S && $2 == "dir" && $3 == "active" {
+      OK=1
+    }
 
-    info "VMID ${VMID} existente detectado. Parando e destruindo para recriação..."
-    qm stop "$VMID" >/dev/null 2>&1 || true
-    sleep 2
-    qm destroy "$VMID" --purge 1 --destroy-unreferenced-disks 1
+    END {
+      exit !OK
+    }
+  ' || fail "Storage '${LOCAL_STORAGE}' nao esta ativo ou nao e DIR."
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# STORAGE CEPH
+# =============================================================================
+
+CURRENT_STEP="Validando storage ${STORAGE}"
+
+pvesm status --storage "$STORAGE" 2>/dev/null |
+  awk -v S="$STORAGE" '
+    $1 == S && $2 == "rbd" && $3 == "active" {
+      OK=1
+    }
+
+    END {
+      exit !OK
+    }
+  ' || fail "Storage '${STORAGE}' nao esta ativo ou nao e RBD."
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# BRIDGE
+# =============================================================================
+
+CURRENT_STEP="Validando bridge ${BRIDGE}"
+
+ip link show "$BRIDGE" >/dev/null 2>&1 \
+  || fail "Bridge ${BRIDGE} nao encontrada."
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# VMID
+# =============================================================================
+
+CURRENT_STEP="Validando VMID ${VMID}"
+
+if qm status "$VMID" &>/dev/null; then
+
+  fail "VMID ${VMID} ja existe."
+
 fi
 
-if qm status "$VMID" >/dev/null 2>&1; then
-    echo "Falha ao destruir VMID ${VMID} anterior."
-    false
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# MAC
+# =============================================================================
+
+CURRENT_STEP="Validando endereco MAC"
+
+if grep -Rqi \
+  -- "$MAC" \
+  /etc/pve/qemu-server/*.conf \
+  2>/dev/null
+then
+
+  fail "MAC ${MAC} ja esta configurado em outra VM."
+
 fi
 
-rm -f "$CRED_FILE" 2>/dev/null || true
-ok "VMID ${VMID} pronto para criação limpa."
+msg_ok "$CURRENT_STEP"
 
-# ============================================================
-# CRIAR VM
-# ============================================================
+# =============================================================================
+# QUORUM
+# =============================================================================
 
-step "CRIAR_VM" "Provisionando VM ${VMID} (${HOSTNAME}) com Debian ${OS_VERSION}"
+CURRENT_STEP="Validando quorum"
 
-info "Baixando imagem cloud e provisionando VM via script da comunidade..."
-info "(Acompanhe o download e criação em tempo real abaixo):"
+pvecm status 2>/dev/null |
+  grep -Eq '^Quorate:[[:space:]]+Yes$' \
+  || fail "Cluster Proxmox esta sem quorum."
 
-# Baixa e executa o script da comunidade com parâmetros de rede estática Proxmox
-env VM_UNATTENDED=1 \
-    VM_OS_VERSION="$OS_VERSION" \
-    VM_VMID="$VMID" \
-    VM_DISK_SIZE="$DISK" \
-    VM_HOSTNAME="$HOSTNAME" \
-    VM_CORES="$CPU" \
-    VM_RAM="$RAM" \
-    VM_BRIDGE="$BRIDGE" \
-    VM_MAC="$MAC" \
-    VM_STORAGE="$STORAGE" \
-    VM_MACHINE="$MACHINE" \
-    VM_START="no" \
-    VM_CLOUD_INIT="yes" \
-    CLOUDINIT_USER="root" \
-    CLOUDINIT_PASSWORD="$ROOTPASS" \
-    CLOUDINIT_NETWORK_MODE="static" \
-    CLOUDINIT_IP="$CIDR" \
-    CLOUDINIT_GW="$GW" \
-    CLOUDINIT_DNS="$DNS1 $DNS2" \
-    CLOUDINIT_SEARCH_DOMAIN="$DOMAIN" \
-    bash -c "$(curl -fsSL "$COMMUNITY_SCRIPT_URL")" 2>&1 | tee -a "$LOG" >&3
+msg_ok "$CURRENT_STEP"
 
-# Garante que a VM foi criada no Proxmox
-if ! qm status "$VMID" >/dev/null 2>&1; then
-    echo "Falha: VM ${VMID} não foi encontrada após execução do script de criação."
-    false
+# =============================================================================
+# HA
+# =============================================================================
+
+CURRENT_STEP="Validando HA Manager"
+
+ha-manager status >/dev/null 2>&1 \
+  || fail "HA Manager nao esta disponivel."
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# DIRETORIO LOCAL
+# =============================================================================
+
+CURRENT_STEP="Preparando diretorio da imagem"
+
+mkdir -p "$IMAGE_DIR"
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# OBTER CHECKSUM OFICIAL
+# =============================================================================
+
+CURRENT_STEP="Obtendo SHA512 oficial"
+
+msg_info "$CURRENT_STEP"
+
+EXPECTED_SHA="$(
+  wget -qO- "$CHECKSUM_URL" |
+    awk -v F="$IMAGE_NAME" '
+      $2 == F || $2 == "*" F {
+        print $1
+        exit
+      }
+    '
+)"
+
+[[ -n "$EXPECTED_SHA" ]] \
+  || fail "Nao foi possivel obter SHA512 oficial."
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# VALIDAR / BAIXAR IMAGEM
+# =============================================================================
+
+DOWNLOAD_IMAGE="yes"
+
+if [[ -s "$IMAGE_PATH" ]]; then
+
+  CURRENT_STEP="Validando imagem existente"
+
+  msg_info "$CURRENT_STEP"
+
+  ACTUAL_SHA="$(
+    sha512sum "$IMAGE_PATH" |
+      awk '{print $1}'
+  )"
+
+  if [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]]; then
+
+    DOWNLOAD_IMAGE="no"
+
+    msg_ok "Imagem oficial atual ja existe"
+
+  else
+
+    msg_warn "Imagem existente nao corresponde ao latest atual"
+
+  fi
+
 fi
 
-rm -f "$CRED_FILE" 2>/dev/null || true
-ok "VM ${VMID} provisionada com sucesso."
+if [[ "$DOWNLOAD_IMAGE" == "yes" ]]; then
 
-# ============================================================
-# CONFIGURAR PROXMOX / noVNC
-# ============================================================
+  CURRENT_STEP="Baixando Debian 13 GenericCloud"
 
-step "CONFIGURAR_PROXMOX" "Ajustando parâmetros de hardware e console noVNC"
+  msg_info "$CURRENT_STEP"
 
-qm set "$VMID" --vga std >/dev/null
-qm set "$VMID" --tablet 1 >/dev/null
-qm set "$VMID" --agent enabled=1 >/dev/null
-qm set "$VMID" --onboot 1 >/dev/null
-qm set "$VMID" --boot order=scsi0 >/dev/null
+  rm -f "${IMAGE_PATH}.part"
 
-# Remove console serial para garantir noVNC nativo
-qm set "$VMID" --delete serial0 >/dev/null 2>&1 || true
+  wget \
+    --progress=bar:force:noscroll \
+    -O "${IMAGE_PATH}.part" \
+    "$IMAGE_URL"
 
-ok "Hardware configurado: VGA=std (noVNC), QEMU Guest Agent ativo, Boot=scsi0."
+  mv "${IMAGE_PATH}.part" "$IMAGE_PATH"
 
-# ============================================================
-# PRIMEIRO BOOT
-# ============================================================
+  msg_ok "$CURRENT_STEP"
 
-step "PRIMEIRO_BOOT" "Iniciando a VM ${VMID} pela primeira vez"
-
-qm start "$VMID"
-ok "VM ${VMID} iniciada."
-
-# ============================================================
-# AGUARDAR QEMU GUEST AGENT
-# ============================================================
-
-step "AGUARDAR_AGENT" "Aguardando inicialização do QEMU Guest Agent"
-
-AGENT_OK=0
-AGENT_WAITED=0
-
-while (( AGENT_WAITED < AGENT_WAIT_SECONDS )); do
-    if qm guest cmd "$VMID" ping >/dev/null 2>&1; then
-        AGENT_OK=1
-        break
-    fi
-    sleep 2
-    AGENT_WAITED=$((AGENT_WAITED + 2))
-    if (( AGENT_WAITED % 10 == 0 )); then
-        info "Aguardando Guest Agent responder... (${AGENT_WAITED}s/${AGENT_WAIT_SECONDS}s)"
-    fi
-done
-
-if [[ "$AGENT_OK" != "1" ]]; then
-    echo "QEMU Guest Agent não respondeu após ${AGENT_WAIT_SECONDS}s."
-    false
 fi
 
-ok "QEMU Guest Agent comunicando normalmente (${AGENT_WAITED}s)."
+# =============================================================================
+# SHA512
+# =============================================================================
 
-# ============================================================
-# AGUARDAR CLOUD-INIT
-# ============================================================
+CURRENT_STEP="Validando SHA512"
 
-step "AGUARDAR_CLOUD_INIT" "Aguardando Cloud-Init concluir inicialização interna"
+msg_info "$CURRENT_STEP"
 
-CI_OK=0
-CI_WAITED=0
+ACTUAL_SHA="$(
+  sha512sum "$IMAGE_PATH" |
+    awk '{print $1}'
+)"
 
-while (( CI_WAITED < CLOUDINIT_WAIT_SECONDS )); do
-    CI_JSON="$(qm guest exec "$VMID" --timeout 20 -- bash -lc 'cloud-init status 2>/dev/null || true' 2>/dev/null || true)"
+[[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] \
+  || fail "SHA512 da imagem nao corresponde ao SHA512 oficial."
 
-    CI_STATUS="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("out-data", "").strip())
-except Exception:
-    pass
-' "$CI_JSON" 2>/dev/null || true)"
+msg_ok "SHA512 valido"
 
-    if grep -qE 'status: (done|degraded)' <<<"$CI_STATUS"; then
-        CI_OK=1
-        break
-    fi
+# =============================================================================
+# QCOW2
+# =============================================================================
 
-    sleep 3
-    CI_WAITED=$((CI_WAITED + 3))
-    if (( CI_WAITED % 15 == 0 )); then
-        info "Aguardando Cloud-Init finalizar... (${CI_WAITED}s/${CLOUDINIT_WAIT_SECONDS}s)"
-    fi
-done
+CURRENT_STEP="Validando QCOW2"
 
-if [[ "$CI_OK" != "1" ]]; then
-    echo "Cloud-Init não terminou após ${CLOUDINIT_WAIT_SECONDS}s."
-    false
-fi
+qemu-img check "$IMAGE_PATH" >/dev/null
 
-ok "Cloud-Init concluído (${CI_STATUS})."
+msg_ok "$CURRENT_STEP"
 
-# ============================================================
-# SCRIPT DE CONFIGURAÇÃO INTERNA DA VM
-# ============================================================
+# =============================================================================
+# CRIAR COPIA DE TRABALHO
+# =============================================================================
 
-step "CONFIGURAR_GUEST" "Aplicando configurações definitivas de Rede, SSH, Hosts, NTP e GRUB"
+CURRENT_STEP="Criando copia temporaria da imagem"
 
-GUEST_SCRIPT="$(cat <<'GUEST_EOF'
-set -Eeuo pipefail
+msg_info "$CURRENT_STEP"
 
-HOSTNAME_NEW="$1"
-DOMAIN="$2"
-IP="$3"
-PREFIX="$4"
-GW="$5"
-DNS1="$6"
-DNS2="$7"
-NTP="$8"
-MAC="$9"
-TIMEZONE="${10}"
-IFACE="${11}"
+rm -f "$WORK_IMAGE"
 
-FQDN="${HOSTNAME_NEW}.${DOMAIN}"
-CIDR="${IP}/${PREFIX}"
+cp \
+  --reflink=auto \
+  --sparse=always \
+  "$IMAGE_PATH" \
+  "$WORK_IMAGE"
 
-# 1. Hostname
-hostnamectl set-hostname "$HOSTNAME_NEW"
+msg_ok "$CURRENT_STEP"
 
-# 2. /etc/hosts
-cat >/etc/hosts <<EOF
-127.0.0.1 localhost
-${IP} ${FQDN} ${HOSTNAME_NEW}
+# =============================================================================
+# CONFIGURACAO SSH
+# =============================================================================
+#
+# O prefixo 00 e proposital.
+#
+# O OpenSSH usa o primeiro valor encontrado para varias diretivas.
+# Como /etc/ssh/sshd_config.d/*.conf e processado em ordem,
+# este arquivo deve aparecer antes de eventuais arquivos cloud-image.
+#
+# =============================================================================
 
-::1 localhost ip6-localhost ip6-loopback
-ff02::1 ip6-allnodes
-ff02::2 ip6-allrouters
-EOF
+CURRENT_STEP="Preparando configuracao SSH root"
 
-# 3. Rede Estática (Garante Netplan E systemd-networkd)
-if command -v netplan >/dev/null 2>&1; then
-    mkdir -p /etc/netplan
-    rm -f /etc/netplan/*.yaml 2>/dev/null || true
-    cat >/etc/netplan/01-ad-server.yaml <<EOF
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    ${IFACE}:
-      match:
-        macaddress: ${MAC,,}
-      set-name: ${IFACE}
-      dhcp4: false
-      dhcp6: false
-      addresses:
-        - ${CIDR}
-      routes:
-        - to: default
-          via: ${GW}
-      nameservers:
-        addresses:
-          - ${DNS1}
-          - ${DNS2}
-        search:
-          - ${DOMAIN}
-EOF
-    chmod 600 /etc/netplan/01-ad-server.yaml
-    netplan generate 2>/dev/null || true
-fi
+cat > "$SSH_CONFIG_HOST" <<'EOF'
+# Gerenciado pelo provisionamento Proxmox
 
-# Configuração direta no systemd-networkd (padrão Debian)
-mkdir -p /etc/systemd/network
-cat >/etc/systemd/network/10-${IFACE}.network <<EOF
-[Match]
-Name=${IFACE}
-
-[Network]
-Address=${CIDR}
-Gateway=${GW}
-DNS=${DNS1}
-DNS=${DNS2}
-Domains=${DOMAIN}
-EOF
-
-systemctl enable systemd-networkd 2>/dev/null || true
-systemctl enable systemd-resolved 2>/dev/null || true
-
-# Configura resolv.conf estático se não for symlink do resolved
-if [ ! -L /etc/resolv.conf ]; then
-    cat >/etc/resolv.conf <<EOF
-search ${DOMAIN}
-nameserver ${DNS1}
-nameserver ${DNS2}
-EOF
-fi
-
-# 4. NTP (systemd-timesyncd)
-mkdir -p /etc/systemd/timesyncd.conf.d
-cat >/etc/systemd/timesyncd.conf.d/10-setec.conf <<EOF
-[Time]
-NTP=${NTP}
-FallbackNTP=
-EOF
-
-timedatectl set-timezone "$TIMEZONE"
-systemctl restart systemd-timesyncd 2>/dev/null || true
-
-# 5. SSH Root com senha
-mkdir -p /etc/ssh/sshd_config.d
-cat >/etc/ssh/sshd_config.d/00-root-password.conf <<'EOF'
 PermitRootLogin yes
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
-PermitEmptyPasswords no
 UsePAM yes
 EOF
 
-rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
-rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null || true
+chmod 600 "$SSH_CONFIG_HOST"
 
-passwd -u root >/dev/null 2>&1 || true
-ssh-keygen -A >/dev/null 2>&1 || true
-sshd -t 2>/dev/null || true
-systemctl enable ssh >/dev/null 2>&1 || true
-systemctl restart ssh 2>/dev/null || true
+msg_ok "$CURRENT_STEP"
 
-# 6. QEMU Guest Agent
-systemctl enable qemu-guest-agent >/dev/null 2>&1 || true
+# =============================================================================
+# PERSONALIZAR IMAGEM
+# =============================================================================
 
-# 7. noVNC / VGA console
-systemctl enable getty@tty1.service >/dev/null 2>&1 || true
+CURRENT_STEP="Personalizando Debian 13"
 
-mkdir -p /etc/default/grub.d
-cat >/etc/default/grub.d/99-novnc.cfg <<'EOF'
-GRUB_TERMINAL_INPUT="console"
-GRUB_TERMINAL_OUTPUT="console"
-GRUB_CMDLINE_LINUX_DEFAULT="console=tty0"
-GRUB_CMDLINE_LINUX="console=tty0"
-EOF
+msg_info "$CURRENT_STEP"
 
-update-grub >/dev/null 2>&1 || true
+virt-customize \
+  -a "$WORK_IMAGE" \
+  --install openssh-server,qemu-guest-agent \
+  --mkdir /etc/ssh/sshd_config.d \
+  --upload "${SSH_CONFIG_HOST}:/etc/ssh/sshd_config.d/00-root-password-login.conf" \
+  --chmod '0644:/etc/ssh/sshd_config.d/00-root-password-login.conf' \
+  --run-command 'if id debian >/dev/null 2>&1; then userdel -r debian || true; fi' \
+  --run-command 'systemctl enable ssh.service >/dev/null 2>&1 || true' \
+  --run-command 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true' \
+  --run-command '/usr/sbin/sshd -t'
 
-# 8. Desabilitar Cloud-Init para boots futuros
-touch /etc/cloud/cloud-init.disabled
-sync
-GUEST_EOF
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# VALIDAR IMAGEM CUSTOMIZADA
+# =============================================================================
+
+CURRENT_STEP="Validando imagem personalizada"
+
+qemu-img check "$WORK_IMAGE" >/dev/null
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# CRIAR VM
+# =============================================================================
+
+CURRENT_STEP="Criando VM ${VMID}"
+
+msg_info "$CURRENT_STEP"
+
+qm create "$VMID" \
+  --name "$NAME" \
+  --ostype l26 \
+  --machine q35 \
+  --bios ovmf \
+  --cpu host \
+  --sockets 1 \
+  --cores "$CORES" \
+  --memory "$MEMORY" \
+  --balloon 0 \
+  --scsihw virtio-scsi-single \
+  --net0 "virtio=${MAC},bridge=${BRIDGE}" \
+  --agent "enabled=1" \
+  --serial0 socket \
+  --vga serial0 \
+  --onboot 1 \
+  --description "Debian 13 Trixie | srvAD01 | Ceph RBD | HA"
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# IMPORTAR DISCO
+# =============================================================================
+
+CURRENT_STEP="Importando disco para ${STORAGE}"
+
+msg_info "$CURRENT_STEP"
+
+qm disk import \
+  "$VMID" \
+  "$WORK_IMAGE" \
+  "$STORAGE" \
+  --format raw \
+  >/dev/null
+
+msg_ok "$CURRENT_STEP"
+
+# =============================================================================
+# IDENTIFICAR DISCO
+# =============================================================================
+
+CURRENT_STEP="Localizando disco importado"
+
+IMPORTED_DISK="$(
+  qm config "$VMID" |
+    awk -F': ' '
+      /^unused[0-9]+:/ {
+        print $2
+        exit
+      }
+    '
 )"
 
-GUEST_B64="$(printf '%s' "$GUEST_SCRIPT" | base64 -w0)"
+[[ -n "$IMPORTED_DISK" ]] \
+  || fail "Nao foi possivel localizar o disco importado."
 
-GUEST_JSON="$(qm guest exec "$VMID" --timeout 180 -- bash -lc "printf '%s' '$GUEST_B64' | base64 -d | bash -s -- '$HOSTNAME' '$DOMAIN' '$IP' '$PREFIX' '$GW' '$DNS1' '$DNS2' '$NTP' '$MAC' '$TIMEZONE' '$IFACE'")"
+msg_ok "${CURRENT_STEP}: ${IMPORTED_DISK}"
 
-GUEST_RC="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("exitcode", 99))
-except Exception:
-    print(99)
-' "$GUEST_JSON")"
+# =============================================================================
+# SCSI0
+# =============================================================================
 
-if [[ "$GUEST_RC" != "0" ]]; then
-    echo "Configuração interna do convidado retornou código de erro: ${GUEST_RC}"
-    python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print("STDERR:\n", d.get("err-data", ""))
-    print("STDOUT:\n", d.get("out-data", ""))
-except Exception:
-    pass
-' "$GUEST_JSON"
-    false
-fi
+CURRENT_STEP="Configurando disco SCSI"
 
-ok "Configurações internas aplicadas com sucesso."
+qm set "$VMID" \
+  --scsi0 "${IMPORTED_DISK},discard=on,iothread=1" \
+  >/dev/null
 
-# ============================================================
-# LIMPAR SENHA E CREDENCIAL
-# ============================================================
+qm set "$VMID" \
+  --boot order=scsi0 \
+  >/dev/null
 
-step "LIMPAR_CREDENCIAIS" "Removendo credenciais temporárias"
+msg_ok "$CURRENT_STEP"
 
-rm -f "$CRED_FILE" 2>/dev/null || true
-ROOTPASS=""
-ROOT_PASSWORD=""
+# =============================================================================
+# RESIZE
+# =============================================================================
 
-ok "Credenciais temporárias removidas."
+CURRENT_STEP="Redimensionando disco para ${DISK_SIZE}"
 
-# ============================================================
-# REBOOT DEFINITIVO
-# ============================================================
+qm disk resize \
+  "$VMID" \
+  scsi0 \
+  "$DISK_SIZE" \
+  >/dev/null
 
-step "REBOOT_FINAL" "Reiniciando a VM para carregar configurações de rede e GRUB definitivas"
+msg_ok "$CURRENT_STEP"
 
-qm reboot "$VMID"
-sleep 4
+# =============================================================================
+# EFI
+# =============================================================================
 
-# ============================================================
-# AGUARDAR GUEST AGENT PÓS-REBOOT
-# ============================================================
+CURRENT_STEP="Criando EFI Disk"
 
-step "AGUARDAR_AGENT_POS_REBOOT" "Aguardando VM inicializar pós-reboot"
+qm set "$VMID" \
+  --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=0" \
+  >/dev/null
 
-AGENT_OK=0
-AGENT_WAITED=0
+msg_ok "$CURRENT_STEP"
 
-while (( AGENT_WAITED < AGENT_WAIT_SECONDS )); do
-    if qm guest cmd "$VMID" ping >/dev/null 2>&1; then
-        AGENT_OK=1
-        break
-    fi
-    sleep 2
-    AGENT_WAITED=$((AGENT_WAITED + 2))
-done
+# =============================================================================
+# TPM
+# =============================================================================
 
-if [[ "$AGENT_OK" != "1" ]]; then
-    echo "Guest Agent não retornou após o reboot."
-    false
-fi
+CURRENT_STEP="Criando TPM 2.0"
 
-sleep 4
-ok "VM online e comunicando normalmente pós-reboot."
+qm set "$VMID" \
+  --tpmstate0 "${STORAGE}:1,version=v2.0" \
+  >/dev/null
 
-# ============================================================
-# AGUARDAR SINCRONIZAÇÃO NTP
-# ============================================================
+msg_ok "$CURRENT_STEP"
 
-step "AGUARDAR_NTP" "Confirmando sincronização de horário com servidor NTP (${NTP})"
+# =============================================================================
+# CLOUD-INIT
+# =============================================================================
 
-NTP_OK=0
-NTP_WAITED=0
+CURRENT_STEP="Criando Cloud-Init Disk"
 
-while (( NTP_WAITED < NTP_WAIT_SECONDS )); do
-    NTP_JSON="$(qm guest exec "$VMID" --timeout 15 -- bash -lc "timedatectl timesync-status 2>/dev/null | grep -q '$NTP'" 2>/dev/null || true)"
+qm set "$VMID" \
+  --ide2 "${STORAGE}:cloudinit" \
+  >/dev/null
 
-    NTP_RC="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("exitcode", 99))
-except Exception:
-    print(99)
-' "$NTP_JSON")"
+msg_ok "$CURRENT_STEP"
 
-    if [[ "$NTP_RC" == "0" ]]; then
-        NTP_OK=1
-        break
-    fi
+# =============================================================================
+# CLOUD-INIT ROOT
+# =============================================================================
 
-    sleep 2
-    NTP_WAITED=$((NTP_WAITED + 2))
-done
+CURRENT_STEP="Configurando usuario root"
 
-if [[ "$NTP_OK" != "1" ]]; then
-    warn "NTP ${NTP} ainda não sincronizou totalmente, prosseguindo com testes..."
-else
-    ok "NTP ${NTP} sincronizado com sucesso."
-fi
+msg_info "$CURRENT_STEP"
 
-# ============================================================
-# VALIDAÇÃO INTERNA COMPLETA
-# ============================================================
+qm set "$VMID" \
+  --ciuser root \
+  --cipassword "$ROOT_PASSWORD" \
+  --ipconfig0 ip=dhcp \
+  --ciupgrade 0 \
+  >/dev/null
 
-step "VALIDACAO_GUEST" "Executando bateria de testes dentro da VM"
+qm cloudinit update "$VMID" >/dev/null
 
-CHECK_SCRIPT="$(cat <<'CHECK_EOF'
-set -Eeuo pipefail
+msg_ok "$CURRENT_STEP"
 
-EXPECTED_HOST="$1"
-EXPECTED_FQDN="$2"
-EXPECTED_IP="$3"
-EXPECTED_PREFIX="$4"
-EXPECTED_GW="$5"
-EXPECTED_DNS1="$6"
-EXPECTED_DNS2="$7"
-EXPECTED_NTP="$8"
-IFACE="$9"
+# A senha nao precisa mais permanecer na variavel.
+unset ROOT_PASSWORD
 
-HOST="$(hostname)"
-FQDN="$(hostname -f 2>/dev/null || hostname)"
-IP="$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4; exit}')"
-GW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+# =============================================================================
+# VALIDAR CLOUD-INIT
+# =============================================================================
 
-SSH="$(systemctl is-active ssh 2>/dev/null || echo inactive)"
-ROOTLOGIN="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')"
-PASSAUTH="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication" {print $2; exit}')"
-ROOTPW="$(passwd -S root 2>/dev/null | awk '{print $2}')"
+CURRENT_STEP="Validando Cloud-Init root"
 
-CLOUD="enabled"
-if [[ -f /etc/cloud/cloud-init.disabled ]]; then
-    CLOUD="disabled"
-fi
-
-NTP_SERVER="$(timedatectl timesync-status 2>/dev/null | awk '/Server:/ {print $2; exit}' || echo none)"
-DNS="$(resolvectl dns "$IFACE" 2>/dev/null | sed -E "s/^Link [0-9]+ \(${IFACE}\):[[:space:]]*//" | xargs || true)"
-if [[ -z "$DNS" && -f /etc/resolv.conf ]]; then
-    DNS="$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | xargs || true)"
-fi
-
-GETTY="$(systemctl is-enabled getty@tty1.service 2>/dev/null || true)"
-CMDLINE="$(cat /proc/cmdline)"
-
-GATEWAY_TEST="FALHA"
-if ping -c1 -W2 "$EXPECTED_GW" >/dev/null 2>&1; then
-    GATEWAY_TEST="OK"
-fi
-
-DNS1_TEST="FALHA"
-if ping -c1 -W2 "$EXPECTED_DNS1" >/dev/null 2>&1; then
-    DNS1_TEST="OK"
-fi
-
-DNS2_TEST="FALHA"
-if ping -c1 -W2 "$EXPECTED_DNS2" >/dev/null 2>&1; then
-    DNS2_TEST="OK"
-fi
-
-INTERNET_TEST="FALHA"
-if getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
-    INTERNET_TEST="OK"
-fi
-
-printf 'HOST=%s\n' "$HOST"
-printf 'FQDN=%s\n' "$FQDN"
-printf 'IP=%s\n' "$IP"
-printf 'GW=%s\n' "$GW"
-printf 'SSH=%s\n' "$SSH"
-printf 'ROOTLOGIN=%s\n' "$ROOTLOGIN"
-printf 'PASSAUTH=%s\n' "$PASSAUTH"
-printf 'ROOTPW=%s\n' "$ROOTPW"
-printf 'CLOUD=%s\n' "$CLOUD"
-printf 'NTP=%s\n' "$NTP_SERVER"
-printf 'DNS=%s\n' "$DNS"
-printf 'GETTY=%s\n' "$GETTY"
-printf 'CMDLINE=%s\n' "$CMDLINE"
-printf 'GATEWAY_TEST=%s\n' "$GATEWAY_TEST"
-printf 'DNS1_TEST=%s\n' "$DNS1_TEST"
-printf 'DNS2_TEST=%s\n' "$DNS2_TEST"
-printf 'INTERNET_TEST=%s\n' "$INTERNET_TEST"
-CHECK_EOF
+CLOUDINIT_DATA="$(
+  qm cloudinit dump "$VMID" user
 )"
 
-CHECK_B64="$(printf '%s' "$CHECK_SCRIPT" | base64 -w0)"
+echo "$CLOUDINIT_DATA" |
+  grep -q '^user: root$' \
+  || fail "Cloud-Init nao esta configurado para root."
 
-CHECK_JSON="$(qm guest exec "$VMID" --timeout 60 -- bash -lc "printf '%s' '$CHECK_B64' | base64 -d | bash -s -- '$HOSTNAME' '$FQDN' '$IP' '$PREFIX' '$GW' '$DNS1' '$DNS2' '$NTP' '$IFACE'")"
+echo "$CLOUDINIT_DATA" |
+  grep -q '^disable_root: False$' \
+  || fail "Cloud-Init nao liberou root."
 
-CHECK_RC="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("exitcode", 99))
-except Exception:
-    print(99)
-' "$CHECK_JSON")"
+msg_ok "$CURRENT_STEP"
 
-[[ "$CHECK_RC" == "0" ]] || { echo "Falha ao executar validação interna."; false; }
+# =============================================================================
+# HA
+# =============================================================================
 
-CHECK_OUT="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("out-data", ""), end="")
-except Exception:
-    pass
-' "$CHECK_JSON")"
+CURRENT_STEP="Adicionando VM ao HA"
 
-# Extrair variáveis de validação
-V_HOST="$(sed -n 's/^HOST=//p' <<<"$CHECK_OUT")"
-V_FQDN="$(sed -n 's/^FQDN=//p' <<<"$CHECK_OUT")"
-V_IP="$(sed -n 's/^IP=//p' <<<"$CHECK_OUT")"
-V_GW="$(sed -n 's/^GW=//p' <<<"$CHECK_OUT")"
-V_SSH="$(sed -n 's/^SSH=//p' <<<"$CHECK_OUT")"
-V_ROOT="$(sed -n 's/^ROOTLOGIN=//p' <<<"$CHECK_OUT")"
-V_PASS="$(sed -n 's/^PASSAUTH=//p' <<<"$CHECK_OUT")"
-V_ROOTPW="$(sed -n 's/^ROOTPW=//p' <<<"$CHECK_OUT")"
-V_CLOUD="$(sed -n 's/^CLOUD=//p' <<<"$CHECK_OUT")"
-V_NTP="$(sed -n 's/^NTP=//p' <<<"$CHECK_OUT")"
-V_DNS="$(sed -n 's/^DNS=//p' <<<"$CHECK_OUT")"
-V_GETTY="$(sed -n 's/^GETTY=//p' <<<"$CHECK_OUT")"
-V_CMDLINE="$(sed -n 's/^CMDLINE=//p' <<<"$CHECK_OUT")"
-V_GATEWAY="$(sed -n 's/^GATEWAY_TEST=//p' <<<"$CHECK_OUT")"
-V_DNS1="$(sed -n 's/^DNS1_TEST=//p' <<<"$CHECK_OUT")"
-V_DNS2="$(sed -n 's/^DNS2_TEST=//p' <<<"$CHECK_OUT")"
-V_INTERNET="$(sed -n 's/^INTERNET_TEST=//p' <<<"$CHECK_OUT")"
+msg_info "$CURRENT_STEP"
 
-# ============================================================
-# VALIDAR RESULTADOS
-# ============================================================
+ha-manager add \
+  "vm:${VMID}" \
+  --state started \
+  >/dev/null
 
-step "VALIDAR_RESULTADOS" "Validando conformidade dos testes com a especificação"
+msg_ok "$CURRENT_STEP"
 
-[[ "$V_HOST" == "$HOSTNAME" ]] || { echo "Hostname incorreto: $V_HOST"; false; }
-[[ "$V_FQDN" == "$FQDN" ]] || { echo "FQDN incorreto: $V_FQDN"; false; }
-[[ "$V_IP" == "$CIDR" ]] || { echo "IP incorreto: $V_IP (esperado $CIDR)"; false; }
-[[ "$V_GW" == "$GW" ]] || { echo "Gateway incorreto: $V_GW (esperado $GW)"; false; }
+# =============================================================================
+# VALIDAR HA
+# =============================================================================
 
-[[ "$V_SSH" == "active" ]] || { echo "Serviço SSH não está ativo."; false; }
-[[ "$V_ROOT" == "yes" ]] || { echo "PermitRootLogin não está habilitado."; false; }
-[[ "$V_PASS" == "yes" ]] || { echo "PasswordAuthentication não está habilitado."; false; }
-[[ "$V_ROOTPW" == "P" ]] || { echo "Senha do root não está desbloqueada."; false; }
+CURRENT_STEP="Validando recurso HA"
 
-[[ "$V_CLOUD" == "disabled" ]] || { echo "Cloud-Init não foi desabilitado."; false; }
+ha-manager config |
+  grep -q "vm:${VMID}" \
+  || fail "VM criada, mas nao registrada corretamente no HA."
 
-[[ "$V_GETTY" == "enabled" ]] || { echo "getty@tty1 não habilitado."; false; }
-[[ "$V_CMDLINE" == *"console=tty0"* ]] || { echo "console=tty0 ausente no cmdline."; false; }
+msg_ok "$CURRENT_STEP"
 
-[[ "$V_GATEWAY" == "OK" ]] || { echo "Teste de ping ao Gateway falhou."; false; }
-[[ "$V_DNS1" == "OK" ]] || { echo "Teste de ping ao DNS1 falhou."; false; }
-[[ "$V_DNS2" == "OK" ]] || { echo "Teste de ping ao DNS2 falhou."; false; }
+# =============================================================================
+# RESULTADO
+# =============================================================================
 
-ok "Conformidade e conectividade validadas com sucesso."
-
-# ============================================================
-# VALIDAÇÃO NO HOST PROXMOX
-# ============================================================
-
-step "VALIDAR_PROXMOX_FINAL" "Validando configuração da VM no Proxmox PVE"
-
-CFG="$(qm config "$VMID")"
-VGA="$(awk -F': ' '/^vga:/ {print $2}' <<<"$CFG")"
-
-[[ "$VGA" == "std" ]] || { echo "VGA não está configurada como std."; false; }
-! grep -q '^serial0:' <<<"$CFG" || { echo "serial0 ainda presente na configuração."; false; }
-[[ "$(qm status "$VMID" | awk '{print $2}')" == "running" ]] || { echo "VM não está em execução."; false; }
-
-# Testa porta SSH aberta no IP estático
-timeout 5 bash -c "</dev/tcp/${IP}/22" || { echo "Porta 22/SSH inacessível em ${IP}."; false; }
-
-[[ ! -e "$CRED_FILE" ]]
-
-ok "Validação final do Proxmox PVE concluída (Porta 22 aberta e respondendo)."
-
-# ============================================================
-# RESULTADO FINAL
-# ============================================================
-
-trap - ERR
-
-exec 1>&3 2>&4
-
-clear 2>/dev/null || true
-
-echo "============================================================"
-echo " ${HOSTNAME} - VM RECRIADA E VALIDADA COM SUCESSO"
-echo "============================================================"
 echo
-echo "STATUS............. OK"
+echo -e "${GN}============================================================${CL}"
+echo -e "${GN} VM CRIADA COM SUCESSO${CL}"
+echo -e "${GN}============================================================${CL}"
 echo
-echo "VMID............... ${VMID}"
-echo "HOSTNAME........... ${V_HOST}"
-echo "FQDN............... ${V_FQDN}"
+
+printf '  %-22s %s\n' "VMID:"             "$VMID"
+printf '  %-22s %s\n' "Nome:"             "$NAME"
+printf '  %-22s %s\n' "CPU:"              "${CORES} vCPU / host"
+printf '  %-22s %s\n' "RAM:"              "${MEMORY} MiB"
+printf '  %-22s %s\n' "Disco:"            "${DISK_SIZE}"
+printf '  %-22s %s\n' "Storage:"          "$STORAGE"
+printf '  %-22s %s\n' "SCSI:"             "VirtIO SCSI Single"
+printf '  %-22s %s\n' "Discard:"          "ON"
+printf '  %-22s %s\n' "IOThread:"         "ON"
+
 echo
-echo "IP................. ${V_IP}"
-echo "GATEWAY............ ${V_GW}"
-echo "DNS................ ${V_DNS}"
-echo "NTP................ ${V_NTP}"
+
+printf '  %-22s %s\n' "Rede:"             "VirtIO"
+printf '  %-22s %s\n' "Bridge:"           "$BRIDGE"
+printf '  %-22s %s\n' "MAC:"              "$MAC"
+printf '  %-22s %s\n' "IPv4:"             "DHCP"
+
 echo
-echo "CPU................ ${CPU} vCPU"
-echo "RAM................ ${RAM} MB"
-echo "DISCO.............. ${DISK}"
-echo "STORAGE............ ${STORAGE}"
-echo "BRIDGE............. ${BRIDGE}"
-echo "MAC................ ${MAC}"
+
+printf '  %-22s %s\n' "Machine:"          "q35"
+printf '  %-22s %s\n' "BIOS:"             "OVMF / UEFI"
+printf '  %-22s %s\n' "EFI:"              "$STORAGE"
+printf '  %-22s %s\n' "TPM:"              "${STORAGE} / TPM 2.0"
+
 echo
-echo "CONSOLE............ noVNC"
-echo "VGA................ ${VGA}"
-echo "TTY1............... ${V_GETTY}"
+
+printf '  %-22s %s\n' "Usuario:"          "root"
+printf '  %-22s %s\n' "Usuario debian:"   "removido"
+printf '  %-22s %s\n' "SSH root:"         "habilitado"
+printf '  %-22s %s\n' "SSH por senha:"    "habilitado"
+printf '  %-22s %s\n' "QEMU Agent:"       "instalado/habilitado"
+printf '  %-22s %s\n' "HA:"               "vm:${VMID}"
+printf '  %-22s %s\n' "HA State:"         "started"
+
 echo
-echo "SSH................ ${V_SSH}"
-echo "USUARIO............ root"
-echo "ROOT LOGIN......... ${V_ROOT}"
-echo "PASSWORD AUTH...... ${V_PASS}"
-echo "ROOT PASSWORD...... configurada"
+
+# =============================================================================
+# CONFIGURACAO EFETIVA
+# =============================================================================
+
+echo -e "${BL}============================================================${CL}"
+echo -e "${BL} CONFIGURACAO EFETIVA DA VM${CL}"
+echo -e "${BL}============================================================${CL}"
 echo
-echo "CLOUD-INIT......... ${V_CLOUD}"
-echo "CREDENCIAL /tmp.... removida"
+
+qm config "$VMID" |
+  grep -E \
+  '^(agent|bios|boot|ciuser|cores|cpu|efidisk0|ide2|ipconfig0|machine|memory|name|net0|scsi0|scsihw|serial0|tpmstate0|vga):'
+
 echo
-echo "GATEWAY TESTE...... ${V_GATEWAY}"
-echo "DNS1 TESTE......... ${V_DNS1}"
-echo "DNS2 TESTE......... ${V_DNS2}"
-echo "INTERNET/DNS....... ${V_INTERNET}"
+
+# =============================================================================
+# HA
+# =============================================================================
+
+echo -e "${BL}============================================================${CL}"
+echo -e "${BL} ESTADO HA${CL}"
+echo -e "${BL}============================================================${CL}"
 echo
-echo "============================================================"
-echo " Acesso SSH:  ssh root@${IP}"
-echo " Console:     Proxmox Web -> VM ${VMID} -> Console (noVNC)"
-echo "============================================================"
+
+ha-manager status |
+  grep -E "(^quorum|^master|vm:${VMID})" \
+  || true
+
+echo
+
+# =============================================================================
+# ACESSO
+# =============================================================================
+
+echo -e "${BL}============================================================${CL}"
+echo -e "${BL} ACESSO${CL}"
+echo -e "${BL}============================================================${CL}"
+echo
+
+echo -e " Usuario SSH:"
+echo
+echo -e "   ${GN}root${CL}"
+echo
+echo -e " Depois de descobrir o IP recebido via DHCP:"
+echo
+echo -e "   ${BL}ssh root@IP_DA_VM${CL}"
+echo
+
+echo -e "${GN}Provisionamento concluido.${CL}"
 echo
