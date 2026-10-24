@@ -11,24 +11,28 @@
 #  CPU..............: 4 vCPU
 #  CPU TYPE.........: host
 #  RAM..............: 4096 MiB
+#  BALLOONING.......: sim
 #
 #  DISK.............: 32 GB
 #  STORAGE..........: Tank (Ceph/RBD)
 #  CONTROLLER.......: VirtIO SCSI Single
 #  DISCARD..........: sim
 #  IOTHREAD.........: sim
+#  SSD EMULATION....: sim
 #
 #  NETWORK..........: VirtIO
 #  BRIDGE...........: vmbr0
 #  MAC..............: BC:24:11:66:25:E3
 #  IPv4.............: DHCP
+#  FIREWALL.........: sim
 #
 #  MACHINE..........: q35
 #  BIOS.............: OVMF / UEFI
 #  EFI STORAGE......: Tank
 #  TPM..............: Tank / TPM 2.0
+#  CONSOLE..........: noVNC
 #
-#  CLOUD-INIT.......: sim
+#  CLOUD-INIT.......: usado no primeiro boot e removido ao final
 #  USUARIO..........: root
 #  SENHA............: solicitada no terminal
 #
@@ -58,6 +62,7 @@ MAC="BC:24:11:66:25:E3"
 
 CORES="4"
 MEMORY="4096"
+BALLOON="4096"
 DISK_SIZE="32G"
 
 IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
@@ -221,6 +226,7 @@ cleanup() {
     rm -f "$DOWNLOAD_TMP" 2>/dev/null || true
     rm -f "$WORK_IMAGE" 2>/dev/null || true
     rm -f "$SSH_CONFIG_HOST" 2>/dev/null || true
+    rm -f "${QGA_UDEV_HOST:-}" 2>/dev/null || true
 }
 
 trap cleanup EXIT
@@ -286,21 +292,26 @@ printf '  %-21s %s\n' "VMID:"       "$VMID"
 printf '  %-21s %s\n' "Nome:"       "$NAME"
 printf '  %-21s %s\n' "CPU:"        "${CORES} vCPU / host"
 printf '  %-21s %s\n' "RAM:"        "${MEMORY} MiB"
+printf '  %-21s %s\n' "Ballooning:" "sim"
 printf '  %-21s %s\n' "Disco:"      "$DISK_SIZE"
 printf '  %-21s %s\n' "Storage:"    "$STORAGE"
 printf '  %-21s %s\n' "Controller:" "VirtIO SCSI Single"
 printf '  %-21s %s\n' "Discard:"    "sim"
 printf '  %-21s %s\n' "IOThread:"   "sim"
+printf '  %-21s %s\n' "SSD Emulation:" "sim"
 printf '  %-21s %s\n' "Rede:"       "VirtIO"
 printf '  %-21s %s\n' "Bridge:"     "$BRIDGE"
 printf '  %-21s %s\n' "MAC:"        "$MAC"
 printf '  %-21s %s\n' "IPv4:"       "DHCP"
+printf '  %-21s %s\n' "Firewall:"   "sim"
 printf '  %-21s %s\n' "Machine:"    "q35"
 printf '  %-21s %s\n' "BIOS:"       "OVMF / UEFI"
 printf '  %-21s %s\n' "EFI:"        "$STORAGE"
 printf '  %-21s %s\n' "TPM:"        "${STORAGE} / TPM 2.0"
+printf '  %-21s %s\n' "Console:"    "noVNC"
 printf '  %-21s %s\n' "Usuario:"    "root"
 printf '  %-21s %s\n' "SSH root:"   "senha habilitada"
+printf '  %-21s %s\n' "Cloud-Init:" "removido apos primeiro boot"
 printf '  %-21s %s\n' "QEMU Agent:" "sim"
 printf '  %-21s %s\n' "HA:"         "sim"
 
@@ -371,6 +382,7 @@ REQUIRED_COMMANDS=(
     qm
     pvesm
     pvecm
+    pvesh
     ha-manager
     qemu-img
     wget
@@ -548,13 +560,16 @@ while IFS= read -r CONF; do
             pvesh get "/nodes/${OLD_NODE}/qemu/${OLD_VMID}/status/current" \
                 --output-format json 2>/dev/null |
             grep -o '"status":"[^"]*"' |
-            cut -d'"' -f4
+            cut -d'"' -f4 \
+            || true
         )"
 
+        if [[ -z "$OLD_STATUS" ]]; then
+            fail "Nao foi possivel determinar o estado da VM ${OLD_VMID} no node ${OLD_NODE}."
+        fi
+
         if [[ "$OLD_STATUS" == "running" ]]; then
-
             fail "A VM ${OLD_VMID} esta LIGADA usando o mesmo MAC ${MAC}."
-
         fi
 
         msg_ok "VM ${OLD_VMID} esta desligada; MAC duplicado permitido temporariamente"
@@ -819,16 +834,24 @@ msg_ok "$CURRENT_STEP"
 # ==============================================================================
 # PERSONALIZAR IMAGEM
 #
-# A imagem GenericCloud pode nao possuir inicialmente:
-#
-#   - SSH host keys
-#   - /run/sshd
-#
-# Ambos sao necessarios para validar a configuracao com "sshd -t"
-# dentro do chroot do virt-customize.
+# - instala openssh-server e qemu-guest-agent
+# - remove o usuario debian
+# - habilita root por senha no SSH
+# - cria host keys do SSH
+# - instala regra udev para iniciar o QEMU Guest Agent quando a porta
+#   org.qemu.guest_agent.0 aparecer
+# - adiciona fallback de inicializacao pelo multi-user.target
 #
 # Todo stdout/stderr permanece somente no LOG_FILE.
 # ==============================================================================
+
+QGA_UDEV_HOST="/tmp/${VMID}-${NAME}-qemu-guest-agent.rules"
+
+cat >"$QGA_UDEV_HOST" <<'EOF'
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.qemu.guest_agent.0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="qemu-guest-agent.service"
+EOF
+
+chmod 600 "$QGA_UDEV_HOST"
 
 run_step \
     "Personalizando Debian 13" \
@@ -836,17 +859,22 @@ run_step \
         -a "$WORK_IMAGE" \
         --install openssh-server,qemu-guest-agent \
         --mkdir /etc/ssh/sshd_config.d \
+        --mkdir /etc/udev/rules.d \
         --upload "${SSH_CONFIG_HOST}:/etc/ssh/sshd_config.d/00-root-password-login.conf" \
         --chmod '0644:/etc/ssh/sshd_config.d/00-root-password-login.conf' \
+        --upload "${QGA_UDEV_HOST}:/etc/udev/rules.d/99-qemu-guest-agent.rules" \
+        --chmod '0644:/etc/udev/rules.d/99-qemu-guest-agent.rules' \
         --run-command 'if id debian >/dev/null 2>&1; then userdel -r debian || true; fi' \
-        --run-command 'systemctl enable ssh.service >/dev/null 2>&1 || true' \
-        --run-command 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true' \
         --run-command 'rm -f /etc/ssh/ssh_host_*' \
         --run-command 'ssh-keygen -A' \
         --run-command 'install -d -m 0755 /run/sshd' \
         --run-command '/usr/sbin/sshd -t' \
         --run-command '/usr/sbin/sshd -T | grep -qx "permitrootlogin yes"' \
-        --run-command '/usr/sbin/sshd -T | grep -qx "passwordauthentication yes"'
+        --run-command '/usr/sbin/sshd -T | grep -qx "passwordauthentication yes"' \
+        --run-command 'install -d /etc/systemd/system/multi-user.target.wants' \
+        --run-command 'ln -sf /usr/lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service'
+
+rm -f "$QGA_UDEV_HOST"
 
 # ==============================================================================
 # VALIDAR IMAGEM CUSTOMIZADA
@@ -871,14 +899,12 @@ run_step \
         --sockets 1 \
         --cores "$CORES" \
         --memory "$MEMORY" \
-        --balloon 0 \
+        --balloon "$BALLOON" \
         --scsihw virtio-scsi-single \
-        --net0 "virtio=${MAC},bridge=${BRIDGE}" \
+        --net0 "virtio=${MAC},bridge=${BRIDGE},firewall=1" \
         --agent "enabled=1" \
-        --serial0 socket \
-        --vga serial0 \
-        --onboot 1 \
-        --description "Debian 13 Trixie GenericCloud | ${NAME} | Ceph RBD | HA"
+        --vga std \
+        --onboot 1
 
 # ==============================================================================
 # IMPORTAR DISCO PARA CEPH
@@ -920,7 +946,7 @@ msg_ok "Disco importado localizado"
 run_step \
     "Configurando VirtIO SCSI" \
     qm set "$VMID" \
-        --scsi0 "${IMPORTED_DISK},discard=on,iothread=1"
+        --scsi0 "${IMPORTED_DISK},discard=on,iothread=1,ssd=1"
 
 # ==============================================================================
 # BOOT
@@ -967,7 +993,7 @@ run_step \
 run_step \
     "Criando Cloud-Init Disk no ${STORAGE}" \
     qm set "$VMID" \
-        --ide2 "${STORAGE}:cloudinit"
+        --scsi1 "${STORAGE}:cloudinit"
 
 # ==============================================================================
 # CLOUD-INIT ROOT
@@ -1020,10 +1046,10 @@ unset CLOUD_USER_DATA
 msg_ok "Cloud-Init root validado"
 
 # ==============================================================================
-# VALIDAR HARDWARE FINAL
+# VALIDAR HARDWARE ANTES DO PRIMEIRO BOOT
 # ==============================================================================
 
-CURRENT_STEP="Validando configuracao da VM"
+CURRENT_STEP="Validando configuracao inicial da VM"
 
 VM_CONFIG="$(
     qm config "$VMID"
@@ -1042,16 +1068,28 @@ echo "$VM_CONFIG" |
     || fail "CPU type host nao configurado."
 
 echo "$VM_CONFIG" |
+    grep -q "^memory: ${MEMORY}$" \
+    || fail "Memoria ${MEMORY} MiB nao configurada."
+
+echo "$VM_CONFIG" |
+    grep -q "^balloon: ${BALLOON}$" \
+    || fail "Ballooning nao configurado."
+
+echo "$VM_CONFIG" |
     grep -q '^scsihw: virtio-scsi-single$' \
     || fail "VirtIO SCSI Single nao configurado."
 
 echo "$VM_CONFIG" |
-    grep -qi "^net0: .*${MAC}" \
-    || fail "MAC ${MAC} nao encontrada na VM."
+    grep -qi "^net0: .*${MAC}.*firewall=1" \
+    || fail "NIC VirtIO com firewall=1 nao configurada."
 
 echo "$VM_CONFIG" |
     grep -q '^agent: enabled=1' \
     || fail "QEMU Agent nao habilitado no Proxmox."
+
+echo "$VM_CONFIG" |
+    grep -q '^scsi0: .*discard=on.*iothread=1.*ssd=1' \
+    || fail "Disco principal nao possui discard, iothread e SSD emulation."
 
 echo "$VM_CONFIG" |
     grep -q '^tpmstate0:' \
@@ -1062,19 +1100,298 @@ echo "$VM_CONFIG" |
     || fail "EFI Disk nao configurado."
 
 echo "$VM_CONFIG" |
-    grep -q '^ide2:.*cloudinit' \
-    || fail "Cloud-Init Disk nao configurado."
+    grep -q '^scsi1:.*cloudinit' \
+    || fail "Cloud-Init Disk nao configurado em scsi1."
+
+echo "$VM_CONFIG" |
+    grep -q '^vga: std$' \
+    || fail "Console noVNC/Standard VGA nao configurado."
+
+if echo "$VM_CONFIG" | grep -q '^description:'; then
+    fail "Notes/description nao deveria estar configurada."
+fi
+
+if echo "$VM_CONFIG" | grep -q '^serial0:'; then
+    fail "Console serial nao deveria estar configurado."
+fi
 
 unset VM_CONFIG
 
-msg_ok "Hardware da VM validado"
+msg_ok "Hardware inicial da VM validado"
 
 # ==============================================================================
-# HA
+# PRIMEIRO BOOT
 #
-# state=started entrega o gerenciamento da inicializacao ao HA.
-# Nao executar "qm start" separadamente.
+# A VM e iniciada fora do HA para:
 #
+#   1. aplicar Cloud-Init;
+#   2. confirmar QEMU Guest Agent;
+#   3. concluir inicializacao do sistema;
+#   4. desligar;
+#   5. remover definitivamente o Cloud-Init drive.
+#
+# Somente depois disso a VM e adicionada ao HA.
+# ==============================================================================
+
+run_step \
+    "Iniciando primeiro boot da VM" \
+    qm start "$VMID"
+
+# ==============================================================================
+# AGUARDAR RUNNING
+# ==============================================================================
+
+CURRENT_STEP="Aguardando primeiro boot"
+
+msg_info "$CURRENT_STEP"
+
+VM_RUNNING="no"
+
+for ((i=1; i<=60; i++)); do
+
+    STATUS="$(
+        qm status "$VMID" 2>/dev/null |
+            awk '{print $2}'
+    )"
+
+    if [[ "$STATUS" == "running" ]]; then
+        VM_RUNNING="yes"
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$VM_RUNNING" != "yes" ]]; then
+    fail "A VM nao entrou em estado running."
+fi
+
+msg_ok "VM iniciada"
+
+# ==============================================================================
+# AGUARDAR QEMU GUEST AGENT
+# ==============================================================================
+
+CURRENT_STEP="Aguardando QEMU Guest Agent"
+
+msg_info "$CURRENT_STEP"
+
+AGENT_RUNNING="no"
+
+for ((i=1; i<=120; i++)); do
+
+    if qm agent "$VMID" ping >>"$LOG_FILE" 2>&1; then
+        AGENT_RUNNING="yes"
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$AGENT_RUNNING" != "yes" ]]; then
+    fail "QEMU Guest Agent nao respondeu apos 240 segundos."
+fi
+
+msg_ok "QEMU Guest Agent respondendo"
+
+# ==============================================================================
+# AGUARDAR CLOUD-INIT
+# ==============================================================================
+
+CURRENT_STEP="Aguardando Cloud-Init concluir"
+
+msg_info "$CURRENT_STEP"
+
+set +e
+
+CLOUDINIT_RESULT="$(
+    qm guest exec "$VMID" \
+        /usr/bin/cloud-init status \
+        --timeout 300 \
+        -- --wait \
+        2>>"$LOG_FILE"
+)"
+
+RC=$?
+
+set -e
+
+printf '%s\n' "$CLOUDINIT_RESULT" >>"$LOG_FILE"
+
+if [[ "$RC" -ne 0 ]]; then
+    fail "Falha ao aguardar a conclusao do Cloud-Init."
+fi
+
+if ! echo "$CLOUDINIT_RESULT" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+    fail "Cloud-Init retornou erro dentro da VM."
+fi
+
+if ! echo "$CLOUDINIT_RESULT" | grep -q 'status: done'; then
+    fail "Cloud-Init nao retornou status: done."
+fi
+
+unset CLOUDINIT_RESULT
+
+msg_ok "Cloud-Init concluido"
+
+# ==============================================================================
+# VALIDAR GUEST AGENT DENTRO DO DEBIAN
+# ==============================================================================
+
+CURRENT_STEP="Validando QEMU Guest Agent no Debian"
+
+msg_info "$CURRENT_STEP"
+
+set +e
+
+AGENT_SERVICE_RESULT="$(
+    qm guest exec "$VMID" \
+        /bin/systemctl is-active qemu-guest-agent.service \
+        --timeout 30 \
+        2>>"$LOG_FILE"
+)"
+
+RC=$?
+
+set -e
+
+printf '%s\n' "$AGENT_SERVICE_RESULT" >>"$LOG_FILE"
+
+if [[ "$RC" -ne 0 ]] || \
+   ! echo "$AGENT_SERVICE_RESULT" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0' || \
+   ! echo "$AGENT_SERVICE_RESULT" | grep -q 'active'
+then
+    fail "qemu-guest-agent.service nao esta ativo dentro do Debian."
+fi
+
+unset AGENT_SERVICE_RESULT
+
+msg_ok "QEMU Guest Agent ativo no Debian"
+
+# ==============================================================================
+# DESLIGAR APOS PRIMEIRO BOOT
+# ==============================================================================
+
+run_step \
+    "Desligando VM apos primeiro boot" \
+    qm shutdown "$VMID" \
+        --timeout 60
+
+# ==============================================================================
+# AGUARDAR STOPPED
+# ==============================================================================
+
+CURRENT_STEP="Aguardando desligamento da VM"
+
+msg_info "$CURRENT_STEP"
+
+VM_STOPPED="no"
+
+for ((i=1; i<=90; i++)); do
+
+    STATUS="$(
+        qm status "$VMID" 2>/dev/null |
+            awk '{print $2}'
+    )"
+
+    if [[ "$STATUS" == "stopped" ]]; then
+        VM_STOPPED="yes"
+        break
+    fi
+
+    sleep 1
+done
+
+if [[ "$VM_STOPPED" != "yes" ]]; then
+    fail "A VM nao desligou corretamente."
+fi
+
+msg_ok "VM desligada"
+
+# ==============================================================================
+# REMOVER CLOUD-INIT DRIVE
+#
+# qm disk unlink remove o drive da configuracao e elimina o volume
+# Cloud-Init, que e descartavel apos a primeira inicializacao.
+# ==============================================================================
+
+run_step \
+    "Removendo Cloud-Init Drive" \
+    qm disk unlink "$VMID" \
+        --idlist scsi1
+
+# ==============================================================================
+# LIMPAR PARAMETROS CLOUD-INIT
+# ==============================================================================
+
+for CI_OPTION in \
+    ciuser \
+    cipassword \
+    ipconfig0 \
+    ciupgrade
+do
+    if qm config "$VMID" | grep -q "^${CI_OPTION}:"; then
+        run_step \
+            "Removendo parametro ${CI_OPTION}" \
+            qm set "$VMID" \
+                --delete "$CI_OPTION"
+    fi
+done
+
+# ==============================================================================
+# VALIDAR CONFIGURACAO FINAL ANTES DO HA
+# ==============================================================================
+
+CURRENT_STEP="Validando configuracao final"
+
+VM_CONFIG="$(
+    qm config "$VMID"
+)"
+
+echo "$VM_CONFIG" |
+    grep -q '^agent: enabled=1' \
+    || fail "QEMU Agent nao habilitado."
+
+echo "$VM_CONFIG" |
+    grep -q "^balloon: ${BALLOON}$" \
+    || fail "Ballooning nao esta habilitado."
+
+echo "$VM_CONFIG" |
+    grep -q '^vga: std$' \
+    || fail "Console noVNC/Standard VGA nao configurado."
+
+echo "$VM_CONFIG" |
+    grep -q '^scsi0: .*ssd=1' \
+    || fail "SSD emulation nao esta habilitado."
+
+echo "$VM_CONFIG" |
+    grep -q '^net0: .*firewall=1' \
+    || fail "Firewall da interface de rede nao esta habilitado."
+
+if echo "$VM_CONFIG" | grep -q 'cloudinit'; then
+    fail "Cloud-Init Drive ainda esta presente."
+fi
+
+if echo "$VM_CONFIG" |
+    grep -Eq '^(ciuser|cipassword|ipconfig0|ciupgrade):'
+then
+    fail "Parametros Cloud-Init ainda estao presentes."
+fi
+
+if echo "$VM_CONFIG" | grep -q '^description:'; then
+    fail "Notes/description ainda esta configurada."
+fi
+
+if echo "$VM_CONFIG" | grep -q '^serial0:'; then
+    fail "Console serial ainda esta configurado."
+fi
+
+unset VM_CONFIG
+
+msg_ok "Configuracao final validada"
+
+# ==============================================================================
+# ADICIONAR AO HA
 # ==============================================================================
 
 run_step \
@@ -1084,7 +1401,7 @@ run_step \
         --state started
 
 # ==============================================================================
-# VALIDAR HA
+# VALIDAR RECURSO HA
 # ==============================================================================
 
 CURRENT_STEP="Validando recurso HA"
@@ -1098,6 +1415,63 @@ fi
 msg_ok "Recurso HA vm:${VMID} configurado"
 
 # ==============================================================================
+# AGUARDAR HA INICIAR A VM
+# ==============================================================================
+
+CURRENT_STEP="Aguardando inicializacao pelo HA"
+
+msg_info "$CURRENT_STEP"
+
+HA_RUNNING="no"
+
+for ((i=1; i<=120; i++)); do
+
+    STATUS="$(
+        qm status "$VMID" 2>/dev/null |
+            awk '{print $2}'
+    )"
+
+    if [[ "$STATUS" == "running" ]]; then
+        HA_RUNNING="yes"
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$HA_RUNNING" != "yes" ]]; then
+    fail "HA nao iniciou a VM dentro de 240 segundos."
+fi
+
+msg_ok "VM iniciada pelo HA"
+
+# ==============================================================================
+# VALIDAR GUEST AGENT APOS BOOT DEFINITIVO
+# ==============================================================================
+
+CURRENT_STEP="Validando QEMU Guest Agent apos boot definitivo"
+
+msg_info "$CURRENT_STEP"
+
+FINAL_AGENT="no"
+
+for ((i=1; i<=120; i++)); do
+
+    if qm agent "$VMID" ping >>"$LOG_FILE" 2>&1; then
+        FINAL_AGENT="yes"
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$FINAL_AGENT" != "yes" ]]; then
+    fail "VM iniciou pelo HA, mas o QEMU Guest Agent nao esta respondendo."
+fi
+
+msg_ok "QEMU Guest Agent ativo e respondendo"
+
+# ==============================================================================
 # RESULTADO FINAL
 # ==============================================================================
 
@@ -1107,56 +1481,59 @@ echo -e "${GN} PROVISIONAMENTO CONCLUIDO${CL}"
 echo -e "${GN}============================================================${CL}"
 echo
 
-printf '  %-23s %s\n' "VMID:"              "$VMID"
-printf '  %-23s %s\n' "Nome:"              "$NAME"
+printf '  %-25s %s\n' "VMID:"                "$VMID"
+printf '  %-25s %s\n' "Nome:"                "$NAME"
 
 echo
 
-printf '  %-23s %s\n' "CPU:"               "${CORES} vCPU"
-printf '  %-23s %s\n' "CPU Type:"          "host"
-printf '  %-23s %s\n' "RAM:"               "${MEMORY} MiB"
-printf '  %-23s %s\n' "Ballooning:"         "desabilitado"
+printf '  %-25s %s\n' "CPU:"                 "${CORES} vCPU"
+printf '  %-25s %s\n' "CPU Type:"            "host"
+printf '  %-25s %s\n' "RAM:"                 "${MEMORY} MiB"
+printf '  %-25s %s\n' "Ballooning Device:"   "ON"
 
 echo
 
-printf '  %-23s %s\n' "Disco:"             "$DISK_SIZE"
-printf '  %-23s %s\n' "Storage:"           "$STORAGE"
-printf '  %-23s %s\n' "Controller:"        "VirtIO SCSI Single"
-printf '  %-23s %s\n' "Discard:"           "ON"
-printf '  %-23s %s\n' "IOThread:"          "ON"
+printf '  %-25s %s\n' "Disco:"               "$DISK_SIZE"
+printf '  %-25s %s\n' "Storage:"             "$STORAGE"
+printf '  %-25s %s\n' "Controller:"          "VirtIO SCSI Single"
+printf '  %-25s %s\n' "Discard:"             "ON"
+printf '  %-25s %s\n' "IOThread:"            "ON"
+printf '  %-25s %s\n' "SSD Emulation:"       "ON"
 
 echo
 
-printf '  %-23s %s\n' "Rede:"              "VirtIO"
-printf '  %-23s %s\n' "Bridge:"            "$BRIDGE"
-printf '  %-23s %s\n' "MAC:"               "$MAC"
-printf '  %-23s %s\n' "IPv4:"              "DHCP"
+printf '  %-25s %s\n' "Rede:"                "VirtIO"
+printf '  %-25s %s\n' "Bridge:"              "$BRIDGE"
+printf '  %-25s %s\n' "MAC:"                 "$MAC"
+printf '  %-25s %s\n' "IPv4 inicial:"        "DHCP"
+printf '  %-25s %s\n' "Firewall:"            "ON"
 
 echo
 
-printf '  %-23s %s\n' "Machine:"           "q35"
-printf '  %-23s %s\n' "BIOS:"              "OVMF / UEFI"
-printf '  %-23s %s\n' "EFI Storage:"       "$STORAGE"
-printf '  %-23s %s\n' "TPM:"               "${STORAGE} / TPM 2.0"
+printf '  %-25s %s\n' "Machine:"             "q35"
+printf '  %-25s %s\n' "BIOS:"                "OVMF / UEFI"
+printf '  %-25s %s\n' "EFI Storage:"         "$STORAGE"
+printf '  %-25s %s\n' "TPM:"                 "${STORAGE} / TPM 2.0"
+printf '  %-25s %s\n' "Console:"             "noVNC / Standard VGA"
 
 echo
 
-printf '  %-23s %s\n' "Cloud-Init:"        "$STORAGE"
-printf '  %-23s %s\n' "Usuario:"           "root"
-printf '  %-23s %s\n' "Senha root:"        "configurada"
-printf '  %-23s %s\n' "Usuario debian:"    "removido"
-printf '  %-23s %s\n' "SSH root:"          "habilitado"
-printf '  %-23s %s\n' "SSH por senha:"     "habilitado"
+printf '  %-25s %s\n' "Usuario:"             "root"
+printf '  %-25s %s\n' "Senha root:"          "configurada"
+printf '  %-25s %s\n' "Usuario debian:"      "removido"
+printf '  %-25s %s\n' "SSH root:"            "habilitado"
+printf '  %-25s %s\n' "SSH por senha:"       "habilitado"
+printf '  %-25s %s\n' "Cloud-Init Drive:"    "removido"
+printf '  %-25s %s\n' "QEMU Guest Agent:"    "ATIVO / RESPONDENDO"
+printf '  %-25s %s\n' "Notes:"               "vazio"
 
 echo
 
-printf '  %-23s %s\n' "QEMU Agent:"        "instalado/habilitado"
-printf '  %-23s %s\n' "HA Resource:"       "vm:${VMID}"
-printf '  %-23s %s\n' "HA Requested State:" "started"
+printf '  %-25s %s\n' "HA Resource:"         "vm:${VMID}"
+printf '  %-25s %s\n' "HA Requested State:"  "started"
 
 echo
-
-printf '  %-23s %s\n' "Log completo:"       "$LOG_FILE"
+printf '  %-25s %s\n' "Log completo:"        "$LOG_FILE"
 
 # ==============================================================================
 # CONFIGURACAO EFETIVA
@@ -1170,7 +1547,7 @@ echo
 
 qm config "$VMID" |
     grep -E \
-        '^(agent|bios|boot|ciuser|cores|cpu|efidisk0|ide2|ipconfig0|machine|memory|name|net0|scsi0|scsihw|serial0|tpmstate0|vga):'
+        '^(agent|balloon|bios|boot|cores|cpu|efidisk0|machine|memory|name|net0|scsi0|scsihw|tpmstate0|vga):'
 
 # ==============================================================================
 # HA STATUS
@@ -1201,7 +1578,11 @@ echo
 echo -e "   ${GN}root${CL}"
 echo
 
-echo -e " Apos obter o IP recebido via DHCP:"
+echo -e " Consulte o IP atual pelo QEMU Guest Agent:"
+echo
+echo -e "   ${BL}qm agent ${VMID} network-get-interfaces${CL}"
+echo
+echo -e " Depois acesse:"
 echo
 echo -e "   ${BL}ssh root@IP_DA_VM${CL}"
 echo
