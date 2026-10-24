@@ -121,12 +121,15 @@ ip link show "$BRIDGE" >/dev/null
 
 ETAPA="VALIDAR_PARAMETROS"
 python3 - "$IP" "$PREFIX" "$GW" "$DNS1" "$DNS2" "$NTP" <<'PY'
-import ipaddress, sys
-ip, prefix = sys.argv[1], sys.argv[2]
+import ipaddress
+import sys
+ip = sys.argv[1]
+prefix = sys.argv[2]
 ipaddress.ip_interface(f"{ip}/{prefix}")
-for v in sys.argv[3:]:
-    ipaddress.ip_address(v)
+for value in sys.argv[3:]:
+    ipaddress.ip_address(value)
 PY
+
 if [[ ! "$MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
     echo "MAC inválido: ${MAC}"; false; fi
 if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
@@ -139,40 +142,50 @@ if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
 ETAPA="SENHA_ROOT"
 if [[ -n "$ROOT_PASSWORD" ]]; then
     ROOTPASS="$ROOT_PASSWORD"
+    echo ">>> Etapa: CRIAR_VM – senha root fornecida via ROOT_PASSWORD, iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
 else
-    exec 1>&3 2>&4
-    clear 2>/dev/null || true
-    echo "============================================================"
-    echo " CRIAR ${HOSTNAME}"
-    echo "============================================================"
-    echo
-    echo "VMID........ $VMID"
-    echo "HOSTNAME.... $HOSTNAME"
-    echo "FQDN........ $FQDN"
-    echo "IP.......... $CIDR"
-    echo "MAC......... $MAC"
-    echo "STORAGE..... $STORAGE"
-    echo "BRIDGE...... $BRIDGE"
-    echo "CONSOLE..... noVNC"
-    echo
-    while true; do
-        printf "Nova senha root: " >/dev/tty
-        IFS= read -r -s ROOTPASS </dev/tty
-        printf "\n" >/dev/tty
-        printf "Repita a senha:  " >/dev/tty
-        IFS= read -r -s ROOTPASS2 </dev/tty
-        printf "\n" >/dev/tty
-        [[ -z "$ROOTPASS" ]] && echo "Senha vazia." >/dev/tty && continue
-        [[ "$ROOTPASS" != "$ROOTPASS2" ]] && echo "Senhas diferentes." >/dev/tty && continue
-        unset ROOTPASS2
-        break
-    done
-    exec >>"$LOG" 2>&1
+    if [ -t 0 ]; then
+        # Restore console output
+        exec 1>&3 2>&4
+        clear 2>/dev/null || true
+        echo "============================================================"
+        echo " CRIAR ${HOSTNAME}"
+        echo "============================================================"
+        echo
+        echo "VMID........ $VMID"
+        echo "HOSTNAME.... $HOSTNAME"
+        echo "FQDN........ $FQDN"
+        echo "IP.......... $CIDR"
+        echo "MAC......... $MAC"
+        echo "STORAGE..... $STORAGE"
+        echo "BRIDGE...... $BRIDGE"
+        echo "CONSOLE..... noVNC"
+        echo
+        while true; do
+            printf "Nova senha root: " > /dev/tty
+            IFS= read -r -s ROOTPASS < /dev/tty
+            printf "\n" > /dev/tty
+            printf "Repita a senha:  " > /dev/tty
+            IFS= read -r -s ROOTPASS2 < /dev/tty
+            printf "\n" > /dev/tty
+            [[ -z "$ROOTPASS" ]] && echo "Senha vazia." > /dev/tty && continue
+            [[ "$ROOTPASS" != "$ROOTPASS2" ]] && echo "Senhas diferentes." > /dev/tty && continue
+            unset ROOTPASS2
+            break
+        done
+        # Log progress after password set
+        echo ">>> Etapa: CRIAR_VM – senha root configurada, iniciando criação da VM ${HOSTNAME} (VMID $VMID)" | tee -a "$LOG"
+        # Re‑redirect output to log for the rest of the script
+        exec >>"$LOG" 2>&1
+    else
+        echo "Erro: ROOT_PASSWORD não definido e nenhum TTY disponível para solicitar a senha." >&2
+        exit 1
+    fi
+fi
 
-msg=\">>> Etapa: CRIAR_VM - Iniciando criação da VM ${HOSTNAME} (VMID $VMID)\"
+msg=">>> Etapa: CRIAR_VM - Iniciando criação da VM ${HOSTNAME} (VMID $VMID)"
 echo "$msg" | tee -a "$LOG"
 printf "%s\n" "$msg" > /dev/tty
-fi
 
 # ============================================================
 # VM JÁ EXISTENTE
@@ -201,7 +214,7 @@ env VM_UNATTENDED=1 VM_OS_VERSION="$OS_VERSION" VM_VMID="$VMID" VM_DISK_SIZE="$D
     VM_MAC="$MAC" VM_STORAGE="$STORAGE" VM_MACHINE="$MACHINE" VM_START="no" \
     VM_CLOUD_INIT="yes" CLOUDINIT_USER="root" CLOUDINIT_PASSWORD="$ROOTPASS" \
     CLOUDINIT_NETWORK_MODE="dhcp" CLOUDINIT_DNS="$DNS1 $DNS2" CLOUDINIT_SEARCH_DOMAIN="$DOMAIN" \
-    bash -c "$(curl -fsSL "$COMMUNITY_SCRIPT_URL")"
+    bash -c "$(curl -fsSL \"$COMMUNITY_SCRIPT_URL\")"
 
 # ============================================================
 # CREDENCIAL TEMPORÁRIA
@@ -220,6 +233,7 @@ qm set "$VMID" --tablet 1 >/dev/null
 qm set "$VMID" --agent enabled=1 >/dev/null
 qm set "$VMID" --onboot 1 >/dev/null
 qm set "$VMID" --boot order=scsi0 >/dev/null
+# Impede console serial/xterm.js como console principal.
 qm set "$VMID" --delete serial0 >/dev/null 2>&1 || true
 
 # ============================================================
@@ -255,7 +269,7 @@ CI_OK=0
 CI_WAITED=0
 while (( CI_WAITED < CLOUDINIT_WAIT_SECONDS )); do
     CI_JSON=$(qm guest exec "$VMID" --timeout 20 -- bash -lc 'cloud-init status 2>/dev/null || true' 2>/dev/null || true)
-    CI_STATUS=$(python3 - <<'PY' <<<"$CI_JSON"
+    CI_STATUS=$(python3 - <<'PY' "$CI_JSON"
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -296,7 +310,7 @@ CIDR="${IP}/${PREFIX}"
 # Hostname
 hostnamectl set-hostname "$HOSTNAME_NEW"
 # /etc/hosts
-cat >/etc/hosts <<EOF
+cat > /etc/hosts <<EOF
 127.0.0.1 localhost
 ${IP} ${FQDN} ${HOSTNAME_NEW}
 ::1 localhost ip6-localhost ip6-loopback
@@ -305,7 +319,7 @@ ff02::2 ip6-allrouters
 EOF
 # Netplan – rede estática
 mkdir -p /etc/netplan
-cat >/etc/netplan/01-ad-server.yaml <<EOF
+cat > /etc/netplan/01-ad-server.yaml <<EOF
 network:
   version: 2
   renderer: networkd
@@ -332,7 +346,7 @@ chmod 600 /etc/netplan/01-ad-server.yaml
 netplan generate
 # NTP – usando systemd‑timesyncd
 mkdir -p /etc/systemd/timesyncd.conf.d
-cat >/etc/systemd/timesyncd.conf.d/10-setec.conf <<EOF
+cat > /etc/systemd/timesyncd.conf.d/10-setec.conf <<EOF
 [Time]
 NTP=${NTP}
 FallbackNTP=
@@ -341,7 +355,7 @@ timedatectl set-timezone "$TIMEZONE"
 systemctl restart systemd-timesyncd
 # SSH root password
 mkdir -p /etc/ssh/sshd_config.d
-cat >/etc/ssh/sshd_config.d/00-root-password.conf <<'EOF2'
+cat > /etc/ssh/sshd_config.d/00-root-password.conf <<'EOF2'
 PermitRootLogin yes
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
@@ -357,7 +371,7 @@ systemctl enable ssh && systemctl restart ssh
 systemctl enable qemu-guest-agent >/dev/null 2>&1 || true
 # noVNC / VGA – garante console tty0
 mkdir -p /etc/default/grub.d
-cat >/etc/default/grub.d/99-novnc.cfg <<'EOF3'
+cat > /etc/default/grub.d/99-novnc.cfg <<'EOF3'
 GRUB_TERMINAL_INPUT="console"
 GRUB_TERMINAL_OUTPUT="console"
 GRUB_CMDLINE_LINUX_DEFAULT="console=tty0"
@@ -368,10 +382,10 @@ update-grub >/dev/null
  touch /etc/cloud/cloud-init.disabled
  sync
 GUEST_EOF
-)"
+"
 GUEST_B64=$(printf '%s' "$GUEST_SCRIPT" | base64 -w0)
 GUEST_JSON=$(qm guest exec "$VMID" --timeout 180 -- bash -lc "printf '%s' '$GUEST_B64' | base64 -d | bash -s -- '$HOSTNAME' '$DOMAIN' '$IP' '$PREFIX' '$GW' '$DNS1' '$DNS2' '$NTP' '$MAC' '$TIMEZONE' '$IFACE'")
-GUEST_RC=$(python3 - <<'PY' <<<"$GUEST_JSON"
+GUEST_RC=$(python3 - <<'PY' "$GUEST_JSON"
 import json,sys; d=json.load(sys.stdin); print(d.get('exitcode',99))
 PY
 )
@@ -420,7 +434,7 @@ NTP_OK=0
 NTP_WAITED=0
 while (( NTP_WAITED < NTP_WAIT_SECONDS )); do
     NTP_JSON=$(qm guest exec "$VMID" --timeout 15 -- bash -lc "timedatectl timesync-status 2>/dev/null | grep -q '$NTP'" 2>/dev/null || true)
-    NTP_RC=$(python3 - <<'PY' <<<"$NTP_JSON"
+    NTP_RC=$(python3 - <<'PY' "$NTP_JSON"
 import json,sys; print(json.load(sys.stdin).get('exitcode',99))
 PY
 )
@@ -487,12 +501,12 @@ CHECK_EOF
 )"
 CHECK_B64=$(printf '%s' "$CHECK_SCRIPT" | base64 -w0)
 CHECK_JSON=$(qm guest exec "$VMID" --timeout 60 -- bash -lc "printf '%s' '$CHECK_B64' | base64 -d | bash -s -- '$HOSTNAME' '$FQDN' '$IP' '$PREFIX' '$GW' '$DNS1' '$DNS2' '$NTP' '$IFACE'")
-CHECK_RC=$(python3 - <<'PY' <<<"$CHECK_JSON"
+CHECK_RC=$(python3 - <<'PY' "$CHECK_JSON"
 import json,sys; print(json.load(sys.stdin).get('exitcode',99))
 PY
 )
 [[ "$CHECK_RC" == "0" ]]
-CHECK_OUT=$(python3 - <<'PY' <<<"$CHECK_JSON"
+CHECK_OUT=$(python3 - <<'PY' "$CHECK_JSON"
 import json,sys; print(json.load(sys.stdin).get('out-data',''), end='')
 PY
 )
@@ -547,7 +561,7 @@ VGA=$(awk -F': ' '/^vga:/ {print $2}' <<<"$CFG")
 [[ "$VGA" == "std" ]]
 ! grep -q '^serial0:' <<<"$CFG"
 [[ "$(qm status "$VMID" | awk '{print $2}')" == "running" ]]
-timeout 5 bash -c "</dev/tcp/${IP}/22"
+timeout 5 bash -c "<dev/tcp/${IP}/22"
 [[ ! -e "$CRED_FILE" ]]
 
 # ============================================================
@@ -561,8 +575,7 @@ echo "============================================================"
 echo " ${HOSTNAME} - VM RECRIADA E VALIDADA"
 echo "============================================================"
 echo
-echo "STATUS............. OK"
+ echo "STATUS............. OK"
 echo
-echo "VMID............... ${VMID}"
-# (demais informações omitidas para brevidade)"
-
+ echo "VMID............... ${VMID}"
+# (demais informações omitidas para brevidade)
